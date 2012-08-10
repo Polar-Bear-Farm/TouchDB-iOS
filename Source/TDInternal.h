@@ -6,11 +6,16 @@
 //  Copyright (c) 2011 Couchbase, Inc. All rights reserved.
 //
 
-#import "TDDatabase.h"
+#import <TouchDB/TDDatabase.h>
+#import "TDDatabase+Attachments.h"
+#import "TDDatabaseManager.h"
 #import "TDView.h"
 #import "TDServer.h"
+#import "TDRouter.h"
 #import "TDReplicator.h"
 #import "TDRemoteRequest.h"
+#import "TDBlobStore.h"
+@class TDAttachment;
 
 
 @interface TDDatabase ()
@@ -35,23 +40,22 @@
 @end
 
 @interface TDDatabase (Attachments_Internal)
-- (TDStatus) insertAttachment: (NSData*)contents
-                  forSequence: (SequenceNumber)sequence
-                        named: (NSString*)filename
-                         type: (NSString*)contentType
-                       revpos: (unsigned)revpos;
+- (void) rememberAttachmentWritersForDigests: (NSDictionary*)writersByDigests;
+#if DEBUG
+- (id) attachmentWriterForAttachment: (NSDictionary*)attachment;
+#endif
+- (BOOL) storeBlob: (NSData*)blob creatingKey: (TDBlobKey*)outKey;
+- (TDStatus) insertAttachment: (TDAttachment*)attachment
+                  forSequence: (SequenceNumber)sequence;
 - (TDStatus) copyAttachmentNamed: (NSString*)name
                     fromSequence: (SequenceNumber)fromSequence
                       toSequence: (SequenceNumber)toSequence;
 @end
 
 @interface TDDatabase (Replication_Internal)
-- (NSString*) lastSequenceWithRemoteURL: (NSURL*)url
-                                   push: (BOOL)push;
-- (BOOL) setLastSequence: (NSString*)lastSequence
-           withRemoteURL: (NSURL*)url
-                    push: (BOOL)push;
-- (void) replicatorDidStop: (TDReplicator*)repl;
+- (void) stopAndForgetReplicator: (TDReplicator*)repl;
+- (NSString*) lastSequenceWithCheckpointID: (NSString*)checkpointID;
+- (BOOL) setLastSequence: (NSString*)lastSequence withCheckpointID: (NSString*)checkpointID;
 + (NSString*) joinQuotedStrings: (NSArray*)strings;
 @end
 
@@ -67,7 +71,22 @@
 @interface TDServer ()
 #if DEBUG
 + (TDServer*) createEmptyAtPath: (NSString*)path;  // for testing
++ (TDServer*) createEmptyAtTemporaryPath: (NSString*)name;  // for testing
 #endif
+@end
+
+
+@interface TDDatabaseManager ()
+@property (readonly, nonatomic) TDReplicatorManager* replicatorManager;
+#if DEBUG
++ (TDDatabaseManager*) createEmptyAtPath: (NSString*)path;  // for testing
++ (TDDatabaseManager*) createEmptyAtTemporaryPath: (NSString*)name;  // for testing
+#endif
+@end
+
+
+@interface TDRouter ()
+- (id) initWithDatabaseManager: (TDDatabaseManager*)dbManager request: (NSURLRequest*)request;
 @end
 
 
@@ -79,10 +98,19 @@
 - (void) beginReplicating;
 - (void) addToInbox: (TDRevision*)rev;
 - (void) processInbox: (TDRevisionList*)inbox;  // override this
-- (void) sendAsyncRequest: (NSString*)method path: (NSString*)relativePath body: (id)body
-             onCompletion: (TDRemoteRequestCompletionBlock)onCompletion;
+- (TDRemoteJSONRequest*) sendAsyncRequest: (NSString*)method
+                                     path: (NSString*)relativePath
+                                     body: (id)body
+                             onCompletion: (TDRemoteRequestCompletionBlock)onCompletion;
 - (void) asyncTaskStarted;
 - (void) asyncTasksFinished: (NSUInteger)numTasks;
 - (void) stopped;
 - (void) databaseClosing;
+
+- (void) reachabilityChanged: (TDReachability*)host;
+- (BOOL) goOffline;
+- (BOOL) goOnline;
+#if DEBUG
+@property (readonly) BOOL savingCheckpoint;
+#endif
 @end

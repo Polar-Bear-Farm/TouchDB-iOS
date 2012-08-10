@@ -7,7 +7,7 @@
 //
 
 #import "TDPuller.h"
-#import "TDDatabase.h"
+#import <TouchDB/TDDatabase.h>
 
 
 /** Replicator that pushes to a remote CouchDB. */
@@ -15,11 +15,10 @@
 {
     BOOL _createTarget;
     BOOL _observing;
-    TDFilterBlock _filter;
+    BOOL _uploading;
+    NSMutableArray* _uploaderQueue;
 }
 
 @property BOOL createTarget;
-
-@property (copy) TDFilterBlock filter;
 
 @end

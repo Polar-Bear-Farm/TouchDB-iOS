@@ -16,9 +16,13 @@
 #import "TDDatabase+Replication.h"
 #import "TDInternal.h"
 #import "TDPuller.h"
+#import "MYBlockUtils.h"
 
 #import "FMDatabase.h"
 #import "FMDatabaseAdditions.h"
+
+
+#define kActiveReplicatorCleanupDelay 10.0
 
 
 @implementation TDDatabase (Replication)
@@ -32,7 +36,7 @@
                                            push: (BOOL)push {
     TDReplicator* repl;
     for (repl in _activeReplicators) {
-        if ($equal(repl.remote, remote) && repl.isPush == push)
+        if ($equal(repl.remote, remote) && repl.isPush == push && repl.running)
             return repl;
     }
     return nil;
@@ -50,34 +54,48 @@
                                  continuous: continuous];
     if (!repl)
         return nil;
-    if (!_activeReplicators)
+    if (!_activeReplicators) {
         _activeReplicators = [[NSMutableArray alloc] init];
+        [[NSNotificationCenter defaultCenter] addObserver: self
+                                                 selector: @selector(replicatorDidStop:)
+                                                     name: TDReplicatorStoppedNotification
+                                                   object: nil];
+    }
     [_activeReplicators addObject: repl];
     [repl release];
     return repl;
 }
 
-- (void) replicatorDidStop: (TDReplicator*)repl {
-    [repl databaseClosing];     // get it to detach from me
+
+- (void) stopAndForgetReplicator: (TDReplicator*)repl {
+    [repl databaseClosing];
     [_activeReplicators removeObjectIdenticalTo: repl];
 }
 
 
-- (NSString*) lastSequenceWithRemoteURL: (NSURL*)url push: (BOOL)push {
-    return [_fmdb stringForQuery:@"SELECT last_sequence FROM replicators WHERE remote=? AND push=?",
-                                 url.absoluteString, $object(push)];
+- (void) replicatorDidStop: (NSNotification*)n {
+    TDReplicator* repl = n.object;
+    if (repl.error)     // Leave it around a while so clients can see the error
+        MYAfterDelay(kActiveReplicatorCleanupDelay,
+                     ^{[_activeReplicators removeObjectIdenticalTo: repl];});
+    else
+        [_activeReplicators removeObjectIdenticalTo: repl];
 }
 
-- (BOOL) setLastSequence: (NSString*)lastSequence withRemoteURL: (NSURL*)url push: (BOOL)push {
+
+- (NSString*) lastSequenceWithCheckpointID: (NSString*)checkpointID {
+    // This table schema is out of date but I'm keeping it the way it is for compatibility.
+    // The 'remote' column now stores the opaque checkpoint IDs, and 'push' is ignored.
+    return [_fmdb stringForQuery:@"SELECT last_sequence FROM replicators WHERE remote=?",
+                                 checkpointID];
+}
+
+- (BOOL) setLastSequence: (NSString*)lastSequence withCheckpointID: (NSString*)checkpointID {
     return [_fmdb executeUpdate: 
-            @"INSERT OR REPLACE INTO replicators (remote, push, last_sequence) VALUES (?, ?, ?)",
-            url.absoluteString, $object(push), lastSequence];
+            @"INSERT OR REPLACE INTO replicators (remote, push, last_sequence) VALUES (?, -1, ?)",
+            checkpointID, lastSequence];
 }
 
-
-static NSString* quote(NSString* str) {
-    return [str stringByReplacingOccurrencesOfString: @"'" withString: @"''"];
-}
 
 + (NSString*) joinQuotedStrings: (NSArray*)strings {
     if (strings.count == 0)
@@ -89,7 +107,10 @@ static NSString* quote(NSString* str) {
             first = NO;
         else
             [result appendString: @"','"];
-        [result appendString: quote(str)];
+        NSRange range = NSMakeRange(result.length, str.length);
+        [result appendString: str];
+        [result replaceOccurrencesOfString: @"'" withString: @"''"
+                                   options: NSLiteralSearch range: range];
     }
     [result appendString: @"'"];
     return result;

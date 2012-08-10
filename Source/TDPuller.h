@@ -7,8 +7,8 @@
 //
 
 #import "TDReplicator.h"
-#import "TDRevision.h"
-@class TDChangeTracker;
+#import <TouchDB/TDRevision.h>
+@class TDChangeTracker, TDSequenceMap;
 
 
 /** Replicator that pulls from a remote CouchDB. */
@@ -16,17 +16,15 @@
 {
     @private
     TDChangeTracker* _changeTracker;
-    unsigned _nextFakeSequence;
-    unsigned _maxInsertedFakeSequence;
-    NSMutableArray* _revsToPull;
-    NSUInteger _httpConnectionCount;
-    TDBatcher* _revsToInsert;
-    NSString* _filterName;
-    NSDictionary* _filterParameters;
+    NSString* _endingSequence;          // Where to stop in noncontinuous pull
+    NSMutableArray* _seenSequences;     // Seq IDs received before _endingSequence is known
+    TDSequenceMap* _pendingSequences;   // Received but not yet copied into local DB
+    NSMutableArray* _revsToPull;        // Queue of TDPulledRevisions to download
+    NSMutableArray* _deletedRevsToPull; // Separate lower-priority of deleted TDPulledRevisions
+    NSMutableArray* _bulkRevsToPull;    // TDPulledRevisions that can be fetched in bulk
+    NSUInteger _httpConnectionCount;    // Number of active NSURLConnections
+    TDBatcher* _downloadsToInsert;      // Queue of TDPulledRevisions, with bodies, to insert in DB
 }
-
-@property (copy) NSString* filterName;
-@property (copy) NSDictionary* filterParameters;
 
 @end
 
@@ -37,8 +35,10 @@
 {
 @private
     NSString* _remoteSequenceID;
+    bool _conflicted;
 }
 
 @property (copy) NSString* remoteSequenceID;
+@property bool conflicted;
 
 @end

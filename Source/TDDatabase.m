@@ -13,10 +13,10 @@
 //  either express or implied. See the License for the specific language governing permissions
 //  and limitations under the License.
 
-#import "TDDatabase.h"
+#import <TouchDB/TDDatabase.h>
 #import "TDDatabase+Attachments.h"
 #import "TDInternal.h"
-#import "TDRevision.h"
+#import <TouchDB/TDRevision.h>
 #import "TDCollateJSON.h"
 #import "TDBlobStore.h"
 #import "TDPuller.h"
@@ -27,7 +27,17 @@
 #import "FMDatabaseAdditions.h"
 
 
+NSString* const TDDatabaseWillCloseNotification = @"TDDatabaseWillClose";
+NSString* const TDDatabaseWillBeDeletedNotification = @"TDDatabaseWillBeDeleted";
+
+
 @implementation TDDatabase
+
+
+static BOOL removeItemIfExists(NSString* path, NSError** outError) {
+    NSFileManager* fmgr = [NSFileManager defaultManager];
+    return [fmgr removeItemAtPath: path error: outError] || ![fmgr fileExistsAtPath: path];
+}
 
 
 - (NSString*) attachmentStorePath {
@@ -36,10 +46,10 @@
 
 
 + (TDDatabase*) createEmptyDBAtPath: (NSString*)path {
-    if (![[NSFileManager defaultManager] removeItemAtPath: path error: nil])
+    if (!removeItemIfExists(path, NULL))
         return nil;
     TDDatabase *db = [[[self alloc] initWithPath: path] autorelease];
-    if (![[NSFileManager defaultManager] removeItemAtPath: db.attachmentStorePath error: nil])
+    if (!removeItemIfExists(db.attachmentStorePath, NULL))
         return nil;
     if (![db open])
         return nil;
@@ -57,9 +67,9 @@
 #if DEBUG
         _fmdb.logsErrors = YES;
 #else
-        _fmdb.logsErrors = WillLogTo(TouchDB);
+        _fmdb.logsErrors = WillLogTo(TDDatabase);
 #endif
-        _fmdb.traceExecution = WillLogTo(TouchDBVerbose);
+        _fmdb.traceExecution = WillLogTo(TDDatabaseVerbose);
     }
     return self;
 }
@@ -81,7 +91,7 @@
     NSString* dstAttachmentsPath = self.attachmentStorePath;
     NSFileManager* fmgr = [NSFileManager defaultManager];
     return [fmgr copyItemAtPath: databasePath toPath: _path error: outError] &&
-           [fmgr removeItemAtPath: dstAttachmentsPath error: outError] &&
+           removeItemIfExists(dstAttachmentsPath, outError) &&
            (!attachmentsPath || [fmgr copyItemAtPath: attachmentsPath 
                                               toPath: dstAttachmentsPath
                                                error: outError]);
@@ -103,6 +113,7 @@
 - (BOOL) open {
     if (_open)
         return YES;
+    LogTo(TDDatabase, @"Open %@", _path);
     if (![_fmdb open])
         return NO;
     
@@ -113,6 +124,8 @@
                              kTDCollateJSON_Raw, TDCollateJSON);
     sqlite3_create_collation(_fmdb.sqliteHandle, "JSON_ASCII", SQLITE_UTF8,
                              kTDCollateJSON_ASCII, TDCollateJSON);
+    sqlite3_create_collation(_fmdb.sqliteHandle, "REVID", SQLITE_UTF8,
+                             NULL, TDCollateRevIDs);
     
     // Stuff we need to initialize every time the database opens:
     if (![self initialize: @"PRAGMA foreign_keys = ON;"])
@@ -140,17 +153,17 @@
             CREATE TABLE revs ( \
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT, \
                 doc_id INTEGER NOT NULL REFERENCES docs(doc_id) ON DELETE CASCADE, \
-                revid TEXT NOT NULL, \
+                revid TEXT NOT NULL COLLATE REVID, \
                 parent INTEGER REFERENCES revs(sequence) ON DELETE SET NULL, \
                 current BOOLEAN, \
                 deleted BOOLEAN DEFAULT 0, \
-                json BLOB); \
-            CREATE INDEX revs_by_id ON revs(revid, doc_id); \
+                json BLOB, \
+                UNIQUE (doc_id, revid)); \
             CREATE INDEX revs_current ON revs(doc_id, current); \
             CREATE INDEX revs_parent ON revs(parent); \
             CREATE TABLE localdocs ( \
                 docid TEXT UNIQUE NOT NULL, \
-                revid TEXT NOT NULL, \
+                revid TEXT NOT NULL COLLATE REVID, \
                 json BLOB); \
             CREATE INDEX localdocs_by_docid ON localdocs(docid); \
             CREATE TABLE views ( \
@@ -192,6 +205,7 @@
             return NO;
         dbVersion = 2;
     }
+    
     if (dbVersion < 3) {
         // Version 3: added localdocs table
         NSString* sql = @"CREATE TABLE IF NOT EXISTS localdocs ( \
@@ -216,6 +230,26 @@
                                  TDCreateUUID(), TDCreateUUID());
         if (![self initialize: sql])
             return NO;
+        dbVersion = 4;
+    }
+
+    if (dbVersion < 5) {
+        // Version 5: added encoding for attachments
+        NSString* sql = @"ALTER TABLE attachments ADD COLUMN encoding INTEGER DEFAULT 0; \
+                          ALTER TABLE attachments ADD COLUMN encoded_length INTEGER; \
+                          PRAGMA user_version = 5";
+        if (![self initialize: sql])
+            return NO;
+        dbVersion = 5;
+    }
+    
+    if (dbVersion < 6) {
+        // Version 6: enable Write-Ahead Log (WAL) <http://sqlite.org/wal.html>
+        NSString* sql = @"PRAGMA journal_mode=WAL; \
+                          PRAGMA user_version = 6";
+        if (![self initialize: sql])
+            return NO;
+        //dbVersion = 6;
     }
 
 #if DEBUG
@@ -240,10 +274,13 @@
     if (!_open)
         return NO;
     
+    LogTo(TDDatabase, @"Close %@", _path);
+    [[NSNotificationCenter defaultCenter] postNotificationName: TDDatabaseWillCloseNotification
+                                                        object: self];
     for (TDView* view in _views.allValues)
         [view databaseClosing];
     setObj(&_views, nil);
-    for (TDReplicator* repl in _activeReplicators)
+    for (TDReplicator* repl in [_activeReplicators.copy autorelease])
         [repl databaseClosing];
     setObj(&_activeReplicators, nil);
     
@@ -255,15 +292,17 @@
 }
 
 - (BOOL) deleteDatabase: (NSError**)outError {
+    LogTo(TDDatabase, @"Deleting %@", _path);
+    [[NSNotificationCenter defaultCenter] postNotificationName: TDDatabaseWillBeDeletedNotification
+                                                        object: self];
     if (_open) {
         if (![self close])
             return NO;
     } else if (!self.exists) {
         return YES;
     }
-    NSFileManager* fmgr = [NSFileManager defaultManager];
-    return [fmgr removeItemAtPath: _path error: outError] 
-        && [fmgr removeItemAtPath: self.attachmentStorePath error: outError];
+    return removeItemIfExists(_path, outError) 
+        && removeItemIfExists(self.attachmentStorePath, outError);
 }
 
 - (void) dealloc {
@@ -279,6 +318,8 @@
     [_validations release];
     [_filters release];
     [_attachments release];
+    [_pendingAttachmentsByDigest release];
+    [[NSNotificationCenter defaultCenter] removeObserver: self];
     [super dealloc];
 }
 
@@ -286,7 +327,7 @@
 
 
 - (UInt64) totalDataSize {
-    NSDictionary* attrs = [[NSFileManager defaultManager] attributesOfItemAtPath: _path error: nil];
+    NSDictionary* attrs = [[NSFileManager defaultManager] attributesOfItemAtPath: _path error: NULL];
     if (!attrs)
         return 0;
     return attrs.fileSize + _attachments.totalDataSize;
@@ -317,21 +358,17 @@
 }
 
 
-- (TDStatus) compact {
-    // Can't delete any rows because that would lose revision tree history.
-    // But we can remove the JSON of non-current revisions, which is most of the space.
-    Log(@"TDDatabase: Deleting JSON of old revisions...");
-    if (![_fmdb executeUpdate: @"UPDATE revs SET json=null WHERE current=0"])
-        return 500;
-    
-    Log(@"Deleting old attachments...");
-    TDStatus status = [self garbageCollectAttachments];
-
-    Log(@"Vacuuming SQLite database...");
-    if (![_fmdb executeUpdate: @"VACUUM"])
-        return 500;
-    
-    Log(@"...Finished database compaction.");
+- (TDStatus) inTransaction: (TDStatus(^)())block {
+    TDStatus status;
+    [self beginTransaction];
+    @try {
+        status = block();
+    } @catch (NSException* x) {
+        Warn(@"Exception raised during -inTransaction: %@", x);
+        status = kTDStatusException;
+    } @finally {
+        [self endTransaction: !TDStatusIsError(status)];
+    }
     return status;
 }
 
@@ -365,31 +402,6 @@
 }
 
 
-/** Splices the contents of an NSDictionary into JSON data (that already represents a dict), without parsing the JSON. */
-static NSData* appendDictToJSON(NSData* json, NSDictionary* dict) {
-    if (!dict.count)
-        return json;
-    NSData* extraJson = [NSJSONSerialization dataWithJSONObject: dict options:0 error:nil];
-    if (!extraJson)
-        return nil;
-    size_t jsonLength = json.length;
-    size_t extraLength = extraJson.length;
-    CAssert(jsonLength >= 2);
-    CAssertEq(*(const char*)json.bytes, '{');
-    if (jsonLength == 2)  // Original JSON was empty
-        return extraJson;
-    NSMutableData* newJson = [NSMutableData dataWithLength: jsonLength + extraLength - 1];
-    if (!newJson)
-        return nil;
-    uint8_t* dst = newJson.mutableBytes;
-    memcpy(dst, json.bytes, jsonLength - 1);                          // Copy json w/o trailing '}'
-    dst += jsonLength - 1;
-    *dst++ = ',';                                                     // Add a ','
-    memcpy(dst, (const uint8_t*)extraJson.bytes + 1, extraLength - 1);  // Add "extra" after '{'
-    return newJson;
-}
-
-
 /** Inserts the _id, _rev and _attachments properties into the JSON data and stores it in rev.
     Rev must already have its revID and sequence properties set. */
 - (NSDictionary*) extraPropertiesForRevision: (TDRevision*)rev options: (TDContentOptions)options
@@ -401,9 +413,8 @@ static NSData* appendDictToJSON(NSData* json, NSDictionary* dict) {
     Assert(sequence > 0);
     
     // Get attachment metadata, and optionally the contents:
-    BOOL withAttachments = (options & kTDIncludeAttachments) != 0;
     NSDictionary* attachmentsDict = [self getAttachmentDictForSequence: sequence
-                                                           withContent: withAttachments];
+                                                               options: options];
     
     // Get more optional stuff to put in the properties:
     //OPT: This probably ends up making redundant SQL queries if multiple options are enabled.
@@ -452,8 +463,8 @@ static NSData* appendDictToJSON(NSData* json, NSDictionary* dict) {
                   options: (TDContentOptions)options
 {
     NSDictionary* extra = [self extraPropertiesForRevision: rev options: options];
-    if (json)
-        rev.asJSON = appendDictToJSON(json, extra);
+    if (json.length > 0)
+        rev.asJSON = [TDJSON appendDictionary: extra toJSONDictionaryData: json];
     else
         rev.properties = extra;
 }
@@ -469,11 +480,11 @@ static NSData* appendDictToJSON(NSData* json, NSDictionary* dict) {
     rev.sequence = sequence;
     NSDictionary* extra = [self extraPropertiesForRevision: rev options: options];
     [rev release];
-    if (!json)
-        return extra;
-    NSMutableDictionary* docProperties = [NSJSONSerialization JSONObjectWithData: json
-                                                            options: NSJSONReadingMutableContainers
-                                                              error: nil];
+    if (json==nil || (json.length==2 && memcmp(json.bytes, "{}", 2)==0))
+        return extra;      // optimization, and workaround for issue #44
+    NSMutableDictionary* docProperties = [TDJSON JSONObjectWithData: json
+                                                            options: TDJSONReadingMutableContainers
+                                                              error: NULL];
     [docProperties addEntriesFromDictionary: extra];
     return docProperties;
 }
@@ -484,23 +495,30 @@ static NSData* appendDictToJSON(NSData* json, NSDictionary* dict) {
                           options: (TDContentOptions)options
 {
     TDRevision* result = nil;
-    NSString* sql;
+    NSMutableString* sql = [NSMutableString stringWithString: @"SELECT revid, deleted, sequence"];
+    if (!(options & kTDNoBody))
+        [sql appendString: @", json"];
     if (revID)
-        sql = @"SELECT revid, deleted, json, sequence FROM revs, docs "
-               "WHERE docs.docid=? AND revs.doc_id=docs.doc_id AND revid=? LIMIT 1";
+        [sql appendString: @" FROM revs, docs "
+               "WHERE docs.docid=? AND revs.doc_id=docs.doc_id AND revid=? LIMIT 1"];
     else
-        sql = @"SELECT revid, deleted, json, sequence FROM revs, docs "
+        [sql appendString: @" FROM revs, docs "
                "WHERE docs.docid=? AND revs.doc_id=docs.doc_id and current=1 and deleted=0 "
-               "ORDER BY revid DESC LIMIT 1";
+               "ORDER BY revid DESC LIMIT 1"];
     FMResultSet *r = [_fmdb executeQuery: sql, docID, revID];
     if ([r next]) {
         if (!revID)
             revID = [r stringForColumnIndex: 0];
         BOOL deleted = [r boolForColumnIndex: 1];
-        NSData* json = [r dataForColumnIndex: 2];
         result = [[[TDRevision alloc] initWithDocID: docID revID: revID deleted: deleted] autorelease];
-        result.sequence = [r longLongIntForColumnIndex: 3];
-        [self expandStoredJSON: json intoRevision: result options: options];
+        result.sequence = [r longLongIntForColumnIndex: 2];
+        
+        if (options != kTDNoBody) {
+            NSData* json = nil;
+            if (!(options & kTDNoBody))
+                json = [r dataNoCopyForColumnIndex: 3];
+            [self expandStoredJSON: json intoRevision: result options: options];
+        }
     }
     [r close];
     return result;
@@ -508,28 +526,27 @@ static NSData* appendDictToJSON(NSData* json, NSDictionary* dict) {
 
 
 - (BOOL) existsDocumentWithID: (NSString*)docID revisionID: (NSString*)revID {
-    return [self getDocumentWithID: docID revisionID: revID options: 0] != nil;
-    //OPT: Do this without loading the data
+    return [self getDocumentWithID: docID revisionID: revID options: kTDNoBody] != nil;
 }
 
 
 - (TDStatus) loadRevisionBody: (TDRevision*)rev
                       options: (TDContentOptions)options
 {
-    if (rev.body)
-        return 200;
+    if (rev.body && options==0)
+        return kTDStatusOK;
     Assert(rev.docID && rev.revID);
     FMResultSet *r = [_fmdb executeQuery: @"SELECT sequence, json FROM revs, docs "
                             "WHERE revid=? AND docs.docid=? AND revs.doc_id=docs.doc_id LIMIT 1",
                             rev.revID, rev.docID];
     if (!r)
-        return 500;
-    TDStatus status = 404;
+        return kTDStatusDBError;
+    TDStatus status = kTDStatusNotFound;
     if ([r next]) {
         // Found the rev. But the JSON still might be null if the database has been compacted.
-        status = 200;
+        status = kTDStatusOK;
         rev.sequence = [r longLongIntForColumnIndex: 0];
-        [self expandStoredJSON: [r dataForColumnIndex: 1] intoRevision: rev options: options];
+        [self expandStoredJSON: [r dataNoCopyForColumnIndex: 1] intoRevision: rev options: options];
     }
     [r close];
     return status;
@@ -587,12 +604,7 @@ static NSData* appendDictToJSON(NSData* json, NSDictionary* dict) {
 }
 
 
-- (NSArray*) getConflictingRevisionIDsOfDocID: (NSString*)docID {
-    SInt64 docNumericID = [self getDocNumericID: docID];
-    if (docNumericID < 0)
-        return nil;
-    FMResultSet* r = [_fmdb executeQuery: @"SELECT revid FROM revs WHERE doc_id=? AND current "
-                                           "ORDER BY revid DESC OFFSET 1", docNumericID];
+static NSArray* revIDsFromResultSet(FMResultSet* r) {
     if (!r)
         return nil;
     NSMutableArray* revIDs = $marray();
@@ -600,6 +612,47 @@ static NSData* appendDictToJSON(NSData* json, NSDictionary* dict) {
         [revIDs addObject: [r stringForColumnIndex: 0]];
     [r close];
     return revIDs;
+}
+
+
+- (NSArray*) getConflictingRevisionIDsOfDocID: (NSString*)docID {
+    SInt64 docNumericID = [self getDocNumericID: docID];
+    if (docNumericID < 0)
+        return nil;
+    FMResultSet* r = [_fmdb executeQuery: @"SELECT revid FROM revs WHERE doc_id=? AND current "
+                                           "ORDER BY revid DESC OFFSET 1", $object(docNumericID)];
+    return revIDsFromResultSet(r);
+}
+
+
+- (NSArray*) getPossibleAncestorRevisionIDs: (TDRevision*)rev limit: (unsigned)limit {
+    int generation = rev.generation;
+    if (generation <= 1)
+        return nil;
+    SInt64 docNumericID = [self getDocNumericID: rev.docID];
+    if (docNumericID <= 0)
+        return nil;
+    int sqlLimit = limit > 0 ? (int)limit : -1;     // SQL uses -1, not 0, to denote 'no limit'
+    FMResultSet* r = [_fmdb executeQuery:
+                      @"SELECT revid FROM revs WHERE doc_id=? and revid < ?"
+                       " and deleted=0 and json not null"
+                       " ORDER BY sequence DESC LIMIT ?",
+                      $object(docNumericID), $sprintf(@"%d-", generation), $object(sqlLimit)];
+    return revIDsFromResultSet(r);
+}
+
+
+- (NSString*) findCommonAncestorOf: (TDRevision*)rev withRevIDs: (NSArray*)revIDs {
+    if (revIDs.count == 0)
+        return nil;
+    SInt64 docNumericID = [self getDocNumericID: rev.docID];
+    if (docNumericID <= 0)
+        return nil;
+    NSString* sql = $sprintf(@"SELECT revid FROM revs "
+                              "WHERE doc_id=? and revid in (%@) and revid <= ? "
+                              "ORDER BY revid DESC LIMIT 1", 
+                              [TDDatabase joinQuotedStrings: revIDs]);
+    return [_fmdb stringForQuery: sql, $object(docNumericID), rev.revID];
 }
     
 
@@ -645,16 +698,6 @@ static NSData* appendDictToJSON(NSData* json, NSDictionary* dict) {
 }
 
 
-// Splits a revision ID into its generation number and opaque suffix string
-static BOOL parseRevID( NSString* revID, int* outNum, NSString** outSuffix) {
-    NSScanner* scanner = [[NSScanner alloc] initWithString: revID];
-    scanner.charactersToBeSkipped = nil;
-    BOOL parsed = [scanner scanInt: outNum] && [scanner scanString: @"-" intoString: nil];
-    *outSuffix = [revID substringFromIndex: scanner.scanLocation];
-    [scanner release];
-    return parsed && *outNum > 0 && (*outSuffix).length > 0;
-}
-
 static NSDictionary* makeRevisionHistoryDict(NSArray* history) {
     if (!history)
         return nil;
@@ -666,7 +709,7 @@ static NSDictionary* makeRevisionHistoryDict(NSArray* history) {
     for (TDRevision* rev in history) {
         int revNo;
         NSString* suffix;
-        if (parseRevID(rev.revID, &revNo, &suffix)) {
+        if ([TDRevision parseRevID: rev.revID intoGeneration: &revNo andSuffix: &suffix]) {
             if (!start)
                 start = $object(revNo);
             else if (revNo != lastRevNo - 1) {
@@ -727,7 +770,7 @@ const TDChangesOptions kDefaultTDChangesOptions = {UINT_MAX, 0, NO, NO, YES};
                                                         deleted: [r boolForColumnIndex: 4]];
             rev.sequence = [r longLongIntForColumnIndex: 0];
             if (includeDocs) {
-                [self expandStoredJSON: [r dataForColumnIndex: 5]
+                [self expandStoredJSON: [r dataNoCopyForColumnIndex: 5]
                           intoRevision: rev
                                options: options->contentOptions];
             }
@@ -795,15 +838,16 @@ const TDChangesOptions kDefaultTDChangesOptions = {UINT_MAX, 0, NO, NO, YES};
     NSMutableArray* views = $marray();
     while ([r next])
         [views addObject: [self viewNamed: [r stringForColumnIndex: 0]]];
+    [r close];
     return views;
 }
 
 
 - (TDStatus) deleteViewNamed: (NSString*)name {
     if (![_fmdb executeUpdate: @"DELETE FROM views WHERE name=?", name])
-        return 500;
+        return kTDStatusDBError;
     [_views removeObjectForKey: name];
-    return _fmdb.changes ? 200 : 404;
+    return _fmdb.changes ? kTDStatusOK : kTDStatusNotFound;
 }
 
 
@@ -872,7 +916,7 @@ const TDChangesOptions kDefaultTDChangesOptions = {UINT_MAX, 0, NO, NO, YES};
             NSDictionary* docContents = nil;
             if (options->includeDocs && !deleted) {
                 // Fill in the document contents:
-                NSData* json = [r dataForColumnIndex: 4];
+                NSData* json = [r dataNoCopyForColumnIndex: 4];
                 SequenceNumber sequence = [r longLongIntForColumnIndex: 5];
                 docContents = [self documentPropertiesFromJSON: json
                                                          docID: docID
@@ -906,40 +950,18 @@ const TDChangesOptions kDefaultTDChangesOptions = {UINT_MAX, 0, NO, NO, YES};
 
 
 
-
+#pragma mark - TESTS:
 #if DEBUG
 
 static TDRevision* mkrev(NSString* revID) {
     return [[[TDRevision alloc] initWithDocID: @"docid" revID: revID deleted: NO] autorelease];
 }
 
-TestCase(TDDatabase_ParseRevID) {
-    RequireTestCase(TDDatabase);
-    int num;
-    NSString* suffix;
-    CAssert(parseRevID(@"1-utiopturoewpt", &num, &suffix));
-    CAssertEq(num, 1);
-    CAssertEqual(suffix, @"utiopturoewpt");
-    
-    CAssert(parseRevID(@"321-fdjfdsj-e", &num, &suffix));
-    CAssertEq(num, 321);
-    CAssertEqual(suffix, @"fdjfdsj-e");
-    
-    CAssert(!parseRevID(@"0-fdjfdsj-e", &num, &suffix));
-    CAssert(!parseRevID(@"-4-fdjfdsj-e", &num, &suffix));
-    CAssert(!parseRevID(@"5_fdjfdsj-e", &num, &suffix));
-    CAssert(!parseRevID(@" 5-fdjfdsj-e", &num, &suffix));
-    CAssert(!parseRevID(@"7 -foo", &num, &suffix));
-    CAssert(!parseRevID(@"7-", &num, &suffix));
-    CAssert(!parseRevID(@"7", &num, &suffix));
-    CAssert(!parseRevID(@"eiuwtiu", &num, &suffix));
-    CAssert(!parseRevID(@"", &num, &suffix));
-}
 
 TestCase(TDDatabase_MakeRevisionHistoryDict) {
     NSArray* revs = $array(mkrev(@"4-jkl"), mkrev(@"3-ghi"), mkrev(@"2-def"));
     CAssertEqual(makeRevisionHistoryDict(revs), $dict({@"ids", $array(@"jkl", @"ghi", @"def")},
-                                                    {@"start", $object(4)}));
+                                                      {@"start", $object(4)}));
     
     revs = $array(mkrev(@"4-jkl"), mkrev(@"2-def"));
     CAssertEqual(makeRevisionHistoryDict(revs), $dict({@"ids", $array(@"4-jkl", @"2-def")}));

@@ -14,7 +14,7 @@
 //  and limitations under the License.
 
 #import <Cocoa/Cocoa.h>
-@class CouchDatabase, CouchReplication, DemoQuery;
+@class CouchDatabase, CouchPersistentReplication, DemoQuery;
 
 
 /** Generic application delegate for simple Mac OS CouchDB demo apps.
@@ -26,6 +26,8 @@
     IBOutlet NSTableView* _table;
     IBOutlet NSArrayController* _tableController;
     IBOutlet NSProgressIndicator* _syncProgress;
+    IBOutlet NSTextField* _syncHostField;
+    IBOutlet NSLevelIndicator* _syncStatusView;
     
     IBOutlet NSPanel* _syncConfigSheet;
     IBOutlet NSTextField* _syncURLField;
@@ -34,7 +36,7 @@
     CouchDatabase* _database;
     DemoQuery* _query;
     BOOL _syncConfiguringDefault;
-    CouchReplication *_pull, *_push;
+    CouchPersistentReplication *_pull, *_push;
     BOOL _glowing;
 }
 

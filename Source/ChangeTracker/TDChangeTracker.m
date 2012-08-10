@@ -17,8 +17,18 @@
 
 #import "TDChangeTracker.h"
 #import "TDConnectionChangeTracker.h"
-#import "TDSocketChangeTracker.h"
+#import "TDAuthorizer.h"
 #import "TDMisc.h"
+#import "TDStatus.h"
+
+
+#define kDefaultHeartbeat (5 * 60.0)
+
+#define kInitialRetryDelay 2.0      // Initial retry delay (doubles after every subsequent failure)
+#define kMaxRetryDelay 300.0        // ...but will never get longer than this
+
+
+static NSURL* AddDotToURLHost( NSURL* url );
 
 
 @interface TDChangeTracker ()
@@ -29,64 +39,65 @@
 @implementation TDChangeTracker
 
 @synthesize lastSequenceID=_lastSequenceID, databaseURL=_databaseURL, mode=_mode;
-@synthesize error=_error, client=_client, filterName=_filterName, filterParameters=_filterParameters;
+@synthesize limit=_limit, heartbeat=_heartbeat, error=_error;
+@synthesize client=_client, filterName=_filterName, filterParameters=_filterParameters;
+@synthesize requestHeaders = _requestHeaders, authorizer=_authorizer;
 
 - (id)initWithDatabaseURL: (NSURL*)databaseURL
                      mode: (TDChangeTrackerMode)mode
+                conflicts: (BOOL)includeConflicts
              lastSequence: (id)lastSequenceID
                    client: (id<TDChangeTrackerClient>)client {
     NSParameterAssert(databaseURL);
     NSParameterAssert(client);
+    Assert([self class] != [TDChangeTracker class]); // abstract!
     self = [super init];
     if (self) {
-        if ([self class] == [TDChangeTracker class]) {
-            [self release];
-            // TDConnectionChangeTracker doesn't work in continuous due to some bug in CFNetwork.
-            if (mode == kContinuous && [databaseURL.scheme.lowercaseString hasPrefix: @"http"]) {
-                return (id) [[TDSocketChangeTracker alloc] initWithDatabaseURL: databaseURL
-                                                                          mode: mode
-                                                                  lastSequence: lastSequenceID
-                                                                        client: client];
-            } else {
-                return (id) [[TDConnectionChangeTracker alloc] initWithDatabaseURL: databaseURL
-                                                                              mode: mode
-                                                                      lastSequence: lastSequenceID
-                                                                            client: client];
-            }
-        }
-    
         _databaseURL = [databaseURL retain];
         _client = client;
         _mode = mode;
+        _heartbeat = kDefaultHeartbeat;
+        _includeConflicts = includeConflicts;
         self.lastSequenceID = lastSequenceID;
     }
     return self;
 }
 
 - (NSString*) databaseName {
-    return _databaseURL.lastPathComponent;
+    return _databaseURL.path.lastPathComponent;
 }
 
 - (NSString*) changesFeedPath {
     static NSString* const kModeNames[3] = {@"normal", @"longpoll", @"continuous"};
     NSMutableString* path;
-    path = [NSMutableString stringWithFormat: @"_changes?feed=%@&heartbeat=300000",
-                                              kModeNames[_mode]];
+    path = [NSMutableString stringWithFormat: @"_changes?feed=%@&heartbeat=%.0f",
+                                              kModeNames[_mode], _heartbeat*1000.0];
+    if (_includeConflicts)
+        [path appendString: @"&style=all_docs"];
     if (_lastSequenceID)
         [path appendFormat: @"&since=%@", TDEscapeURLParam([_lastSequenceID description])];
+    if (_limit > 0)
+        [path appendFormat: @"&limit=%u", _limit];
     if (_filterName) {
         [path appendFormat: @"&filter=%@", TDEscapeURLParam(_filterName)];
-        [_filterParameters enumerateKeysAndObjectsUsingBlock: ^(id key, id value, BOOL *stop) {
+        for (NSString* key in _filterParameters) {
+            id value = [_filterParameters objectForKey: key];
             [path appendFormat: @"&%@=%@", TDEscapeURLParam(key), 
                                            TDEscapeURLParam([value description])];
-        }];
+        }
     }
 
     return path;
 }
 
 - (NSURL*) changesFeedURL {
-    NSMutableString* urlStr = [[_databaseURL.absoluteString mutableCopy] autorelease];
+    // Really ugly workaround for CFNetwork, to make sure that long-running connections like these
+    // don't end up using the same socket pool as regular connections to the same host; otherwise
+    // the regular connections can get stuck indefinitely behind a long-running one.
+    // (This substitution appends a "." to the host name, if it didn't already end with one.)
+    NSURL* url = AddDotToURLHost(_databaseURL);
+
+    NSMutableString* urlStr = [[url.absoluteString mutableCopy] autorelease];
     if (![urlStr hasSuffix: @"/"])
         [urlStr appendString: @"/"];
     [urlStr appendString: self.changesFeedPath];
@@ -94,24 +105,24 @@
 }
 
 - (NSString*) description {
-    return [NSString stringWithFormat: @"%@[%@]", [self class], self.databaseName];
+    return [NSString stringWithFormat: @"%@[%p %@]", [self class], self, self.databaseName];
 }
 
-- (void)dealloc {
+- (void) dealloc {
     [self stop];
     [_filterName release];
     [_filterParameters release];
     [_databaseURL release];
     [_lastSequenceID release];
     [_error release];
+    [_requestHeaders release];
+    [_authorizer release];
     [super dealloc];
 }
 
-- (NSURLCredential*) authCredential {
-    if ([_client respondsToSelector: @selector(authCredential)])
-        return _client.authCredential;
-    else
-        return nil;
+- (void) setUpstreamError: (NSString*)message {
+    Warn(@"%@: Server error: %@", self, message);
+    self.error = [NSError errorWithDomain: @"TDChangeTracker" code: kTDStatusUpstreamError userInfo: nil];
 }
 
 - (BOOL) start {
@@ -120,47 +131,120 @@
 }
 
 - (void) stop {
+    [NSObject cancelPreviousPerformRequestsWithTarget: self selector: @selector(retry)
+                                               object: nil];    // cancel pending retries
     [self stopped];
 }
 
 - (void) stopped {
-    if ([_client respondsToSelector: @selector(changeTrackerStopped:)])
-        [_client changeTrackerStopped: self];
-    _client = nil;  // don't call client anymore even if -stopped is called again (i.e. on dealloc)
+    _retryCount = 0;
+    // Clear client ref so its -changeTrackerStopped: won't be called again during -dealloc
+    id<TDChangeTrackerClient> client = _client;
+    _client = nil;
+    if ([client respondsToSelector: @selector(changeTrackerStopped:)])
+        [client changeTrackerStopped: self];    // note: this method might release/dealloc me
 }
+
+
+- (void) failedWithError: (NSError*)error {
+    // If the error may be transient (flaky network, server glitch), retry:
+    if (TDMayBeTransientError(error)) {
+        NSTimeInterval retryDelay = kInitialRetryDelay * (1 << MIN(_retryCount-1, 31U));
+        retryDelay = MIN(retryDelay, kMaxRetryDelay);
+        Log(@"%@: Connection error, retrying in %.1f sec: %@",
+            self, retryDelay, error.localizedDescription);
+        [self performSelector: @selector(retry) withObject: nil afterDelay: retryDelay];
+    } else {
+        Warn(@"%@: Can't connect, giving up: %@", self, error);
+        self.error = error;
+        [self stopped];
+    }
+}
+
+
+- (void) retry {
+    if ([self start]) {
+        [NSObject cancelPreviousPerformRequestsWithTarget: self selector: @selector(retry)
+                                                   object: nil];    // cancel pending retries
+    }
+}
+
 
 - (BOOL) receivedChange: (NSDictionary*)change {
     if (![change isKindOfClass: [NSDictionary class]])
         return NO;
     id seq = [change objectForKey: @"seq"];
-    if (!seq)
-        return NO;
+    if (!seq) {
+        // If a continuous feed closes (e.g. if its database is deleted), the last line it sends
+        // will indicate the last_seq. This is normal, just ignore it and return success:
+        return [change objectForKey: @"last_seq"] != nil;
+    }
     [_client changeTrackerReceivedChange: change];
     self.lastSequenceID = seq;
     return YES;
 }
 
-- (void) receivedChunk: (NSData*)chunk {
-    if (chunk.length <= 1)
-        return;
-    id change = [NSJSONSerialization JSONObjectWithData: chunk options: 0 error: nil];
-    if (![self receivedChange: change])
-        Warn(@"Received unparseable change line from server: %@", [chunk my_UTF8ToString]);
-}
-
-- (BOOL) receivedPollResponse: (NSData*)body {
+- (NSInteger) receivedPollResponse: (NSData*)body {
     if (!body)
-        return NO;
-    id changeObj = [NSJSONSerialization JSONObjectWithData: body options: 0 error: nil];
+        return -1;
+    id changeObj = [TDJSON JSONObjectWithData: body options: 0 error: NULL];
     NSDictionary* changeDict = $castIf(NSDictionary, changeObj);
     NSArray* changes = $castIf(NSArray, [changeDict objectForKey: @"results"]);
     if (!changes)
-        return NO;
+        return -1;
     for (NSDictionary* change in changes) {
         if (![self receivedChange: change])
-            return NO;
+            return -1;
     }
-    return YES;
+    return changes.count;
 }
 
 @end
+
+
+static NSURL* AddDotToURLHost( NSURL* url ) {
+    CAssert(url);
+    UInt8 urlBytes[1024];
+    CFIndex nBytes = CFURLGetBytes((CFURLRef)url, urlBytes, sizeof(urlBytes) - 1);
+    if (nBytes > 0) {
+        CFRange range;
+        CFURLGetByteRangeForComponent((CFURLRef)url, kCFURLComponentHost, &range);
+        if (range.length >= 2) {
+            CFIndex end = range.location + range.length - 1;
+            if (urlBytes[end] == '/' || urlBytes[end] == ':')
+                --end;
+            if (isalpha(urlBytes[end])) {
+                // Alright, insert the '.' after end:
+                memmove(&urlBytes[end+2], &urlBytes[end+1], nBytes - end);
+                urlBytes[end+1] = '.';
+                NSURL* newURL = (id)(CFURLCreateWithBytes(NULL, urlBytes, nBytes + 1,
+                                                          kCFStringEncodingUTF8, NULL));
+                if (newURL)
+                    url = [newURL autorelease];
+                else
+                    Warn(@"AddDotToURLHost: Failed to add dot to <%@> -- result is <%.*s>",
+                         url, (int)nBytes+1, urlBytes);
+            }
+        }
+    }
+    return url;
+}
+
+
+#if DEBUG
+static NSString* addDot( NSString* urlStr ) {
+    return AddDotToURLHost([NSURL URLWithString: urlStr]).absoluteString;
+}
+
+TestCase(AddDotToURLHost) {
+    CAssertEqual(addDot(@"http://x/y"),                 @"http://x./y");
+    CAssertEqual(addDot(@"http://foo.com"),             @"http://foo.com.");
+    CAssertEqual(addDot(@"http://foo.com/"),            @"http://foo.com./");
+    CAssertEqual(addDot(@"http://foo.com/bar"),         @"http://foo.com./bar");
+    CAssertEqual(addDot(@"http://foo.com:123/"),        @"http://foo.com.:123/");
+    CAssertEqual(addDot(@"http://user:pass@foo.com/"),  @"http://user:pass@foo.com./");
+    CAssertEqual(addDot(@"http://foo.com./"),           @"http://foo.com./");
+    CAssertEqual(addDot(@"http://localhost/"),          @"http://localhost./");
+    CAssertEqual(addDot(@"http://10.0.1.12/"),          @"http://10.0.1.12/");
+}
+#endif

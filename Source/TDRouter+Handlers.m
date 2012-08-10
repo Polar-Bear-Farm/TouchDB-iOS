@@ -5,34 +5,30 @@
 //  Created by Jens Alfke on 1/5/12.
 //  Copyright (c) 2012 Couchbase, Inc. All rights reserved.
 //
+//  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file
+//  except in compliance with the License. You may obtain a copy of the License at
+//    http://www.apache.org/licenses/LICENSE-2.0
+//  Unless required by applicable law or agreed to in writing, software distributed under the
+//  License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+//  either express or implied. See the License for the specific language governing permissions
+//  and limitations under the License.
 
 #import "TDRouter.h"
-#import "TDDatabase.h"
+#import <TouchDB/TDDatabase.h>
 #import "TDDatabase+Attachments.h"
 #import "TDDatabase+Insertion.h"
 #import "TDDatabase+LocalDocs.h"
 #import "TDDatabase+Replication.h"
 #import "TDView.h"
 #import "TDBody.h"
-#import "TDRevision.h"
+#import "TDMultipartDocumentReader.h"
+#import <TouchDB/TDRevision.h>
 #import "TDServer.h"
 #import "TDReplicator.h"
+#import "TDReplicatorManager.h"
 #import "TDPusher.h"
+#import "TDInternal.h"
 #import "TDMisc.h"
-
-
-@interface TDRouter (Handlers_Internal)
-- (TDStatus) update: (TDDatabase*)db
-              docID: (NSString*)docID
-               body: (TDBody*)body
-           deleting: (BOOL)deleting
-      allowConflict: (BOOL)allowConflict
-         createdRev: (TDRevision**)outRev;
-- (TDStatus) update: (TDDatabase*)db
-              docID: (NSString*)docID
-               json: (NSData*)json
-           deleting: (BOOL)deleting;
-@end
 
 
 @implementation TDRouter (Handlers)
@@ -40,20 +36,7 @@
 
 - (void) setResponseLocation: (NSURL*)url {
     // Strip anything after the URL's path (i.e. the query string)
-    CFURLRef cfURL = (CFURLRef)url;
-    CFRange range = CFURLGetByteRangeForComponent(cfURL, kCFURLComponentResourceSpecifier, NULL);
-    if (range.length == 0) {
-        [_response setValue: url.absoluteString ofHeader: @"Location"];
-    } else {
-        CFIndex size = CFURLGetBytes(cfURL, NULL, 0);
-        if (size > 8000)
-            return;
-        UInt8 bytes[size];
-        CFURLGetBytes(cfURL, bytes, size);
-        cfURL = CFURLCreateWithBytes(NULL, bytes, range.location - 1, kCFStringEncodingUTF8, NULL);
-        [_response setValue: (id)CFURLGetString(cfURL) ofHeader: @"Location"];
-        CFRelease(cfURL);
-    }
+    [_response setValue: TDURLWithoutQuery(url).absoluteString ofHeader: @"Location"];
 }
 
 
@@ -65,74 +48,57 @@
                                {@"couchdb", @"Welcome"},        // for compatibility
                                {@"version", [[self class] versionString]});
     _response.body = [TDBody bodyWithProperties: info];
-    return 200;
+    return kTDStatusOK;
 }
 
 - (TDStatus) do_GET_all_dbs {
-    NSArray* dbs = _server.allDatabaseNames ?: $array();
+    NSArray* dbs = _dbManager.allDatabaseNames ?: $array();
     _response.body = [[[TDBody alloc] initWithArray: dbs] autorelease];
-    return 200;
+    return kTDStatusOK;
 }
 
 - (TDStatus) do_POST_replicate {
     // Extract the parameters from the JSON request body:
     // http://wiki.apache.org/couchdb/Replication
-    id body = self.bodyAsDictionary;
-    if (!body)
-        return 400;
-    NSString* source = $castIf(NSString, [body objectForKey: @"source"]);
-    NSString* target = $castIf(NSString, [body objectForKey: @"target"]);
-    BOOL createTarget = [$castIf(NSNumber, [body objectForKey: @"create_target"]) boolValue];
+    TDDatabase* db;
+    NSURL* remote;
+    BOOL push, createTarget;
+    NSDictionary* headers;
+    id<TDAuthorizer> authorizer;
+    NSDictionary* body = self.bodyAsDictionary;
+    TDStatus status = [_dbManager.replicatorManager parseReplicatorProperties: body
+                                                                   toDatabase: &db remote: &remote
+                                                                       isPush: &push
+                                                                 createTarget: &createTarget
+                                                                      headers: &headers
+                                                                   authorizer: &authorizer];
+    if (TDStatusIsError(status))
+        return status;
+    
     BOOL continuous = [$castIf(NSNumber, [body objectForKey: @"continuous"]) boolValue];
     BOOL cancel = [$castIf(NSNumber, [body objectForKey: @"cancel"]) boolValue];
-    
-    // Map the 'source' and 'target' JSON params to a local database and remote URL:
-    if (!source || !target)
-        return 400;
-    BOOL push = NO;
-    TDDatabase* db = [_server existingDatabaseNamed: source];
-    NSString* remoteStr;
-    if (db) {
-        remoteStr = target;
-        push = YES;
-    } else {
-        remoteStr = source;
-        if (createTarget && !cancel) {
-            db = [_server databaseNamed: target];
-            if (![db open])
-                return 500;
-        } else {
-            db = [_server existingDatabaseNamed: target];
-        }
-        if (!db)
-            return 404;
-    }
-    NSURL* remote = [NSURL URLWithString: remoteStr];
-    if (!remote || ![remote.scheme hasPrefix: @"http"])
-        return 400;
-    
     if (!cancel) {
         // Start replication:
         TDReplicator* repl = [db replicatorWithRemoteURL: remote push: push continuous: continuous];
         if (!repl)
-            return 500;
-        if (push) {
+            return kTDStatusServerError;
+        repl.filterName = $castIf(NSString, [body objectForKey: @"filter"]);;
+        repl.filterParameters = $castIf(NSDictionary, [body objectForKey: @"query_params"]);
+        repl.options = body;
+        repl.requestHeaders = headers;
+        repl.authorizer = authorizer;
+        if (push)
             ((TDPusher*)repl).createTarget = createTarget;
-        } else {
-            TDPuller* pullRepl = (TDPuller*)repl;
-            pullRepl.filterName = $castIf(NSString, [body objectForKey: @"filter"]);
-            pullRepl.filterParameters = $castIf(NSDictionary, [body objectForKey: @"query_params"]);
-        }
         [repl start];
         _response.bodyObject = $dict({@"session_id", repl.sessionID});
     } else {
         // Cancel replication:
         TDReplicator* repl = [db activeReplicatorWithRemoteURL: remote push: push];
         if (!repl)
-            return 404;
+            return kTDStatusNotFound;
         [repl stop];
     }
-    return 200;
+    return kTDStatusOK;
 }
 
 
@@ -142,14 +108,14 @@
     for (int i=0; i<count; i++)
         [uuids addObject: [TDDatabase generateDocumentID]];
     _response.bodyObject = $dict({@"uuids", uuids});
-    return 200;
+    return kTDStatusOK;
 }
 
 
 - (TDStatus) do_GET_active_tasks {
     // http://wiki.apache.org/couchdb/HttpGetActiveTasks
     NSMutableArray* activity = $marray();
-    for (TDDatabase* db in _server.allOpenDatabases) {
+    for (TDDatabase* db in _dbManager.allOpenDatabases) {
         for (TDReplicator* repl in db.activeReplicators) {
             NSString* source = repl.remote.absoluteString;
             NSString* target = db.name;
@@ -158,21 +124,48 @@
                 source = target;
                 target = temp;
             }
-            NSUInteger processed = repl.changesProcessed;
-            NSUInteger total = repl.changesTotal;
-            NSString* status = $sprintf(@"Processed %u / %u changes",
-                                        (unsigned)processed, (unsigned)total);
-            long progress = (total > 0) ? lroundf(100*(processed / (float)total)) : 0;
+            NSString* status;
+            id progress = nil;
+            if (!repl.running) {
+                status = @"Stopped";
+            } else if (!repl.online) {
+                status = @"Offline";        // nonstandard
+            } else if (!repl.active) {
+                status = @"Idle";           // nonstandard
+            } else {
+                NSUInteger processed = repl.changesProcessed;
+                NSUInteger total = repl.changesTotal;
+                status = $sprintf(@"Processed %u / %u changes",
+                                  (unsigned)processed, (unsigned)total);
+                progress = (total>0) ? $object(lroundf(100*(processed / (float)total))) : nil;
+            }
+            NSArray* error = nil;
+            NSError* errorObj = repl.error;
+            if (errorObj)
+                error = $array($object(errorObj.code), errorObj.localizedDescription);
+
             [activity addObject: $dict({@"type", @"Replication"},
                                        {@"task", repl.sessionID},
                                        {@"source", source},
                                        {@"target", target},
+                                       {@"continuous", (repl.continuous ? $true : nil)},
                                        {@"status", status},
-                                       {@"progress", $object(progress)})];
+                                       {@"progress", progress},
+                                       {@"error", error})];
         }
     }
     _response.body = [[[TDBody alloc] initWithArray: activity] autorelease];
-    return 200;
+    return kTDStatusOK;
+}
+
+
+- (TDStatus) do_GET_session {
+    // Even though TouchDB doesn't support user logins, it implements a generic response to the
+    // CouchDB _session API, so that apps that call it (such as Futon!) won't barf.
+    _response.bodyObject = $dict({@"ok", $true},
+                                 {@"userCtx", $dict({@"name", $null},
+                                                    {@"roles", $array(@"_admin")})});
+    return kTDStatusOK;
 }
 
 
@@ -182,55 +175,64 @@
 - (TDStatus) do_GET: (TDDatabase*)db {
     // http://wiki.apache.org/couchdb/HTTP_database_API#Database_Information
     TDStatus status = [self openDB];
-    if (status >= 300)
+    if (TDStatusIsError(status))
         return status;
     NSUInteger num_docs = db.documentCount;
     SequenceNumber update_seq = db.lastSequence;
     if (num_docs == NSNotFound || update_seq == NSNotFound)
-        return 500;
+        return kTDStatusDBError;
     _response.bodyObject = $dict({@"db_name", db.name},
                                  {@"db_uuid", db.publicUUID},
                                  {@"doc_count", $object(num_docs)},
                                  {@"update_seq", $object(update_seq)},
                                  {@"disk_size", $object(db.totalDataSize)});
-    return 200;
+    return kTDStatusOK;
 }
 
 
 - (TDStatus) do_PUT: (TDDatabase*)db {
     if (db.exists)
-        return 412;
+        return kTDStatusDuplicate;
     if (![db open])
-        return 500;
+        return kTDStatusDBError;
     [self setResponseLocation: _request.URL];
-    return 201;
+    return kTDStatusCreated;
 }
 
 
 - (TDStatus) do_DELETE: (TDDatabase*)db {
     if ([self query: @"rev"])
-        return 400;  // CouchDB checks for this; probably meant to be a document deletion
-    return [_server deleteDatabaseNamed: db.name] ? 200 : 404;
+        return kTDStatusBadID;  // CouchDB checks for this; probably meant to be a document deletion
+    return [_dbManager deleteDatabaseNamed: db.name] ? kTDStatusOK : kTDStatusNotFound;
 }
 
 
-- (TDStatus) do_POST: (TDDatabase*)db {
-    TDStatus status = [self openDB];
-    if (status >= 300)
+- (TDStatus) do_POST_purge: (TDDatabase*)db {
+    // <http://wiki.apache.org/couchdb/Purge_Documents>
+    NSDictionary* body = self.bodyAsDictionary;
+    if (!body)
+        return kTDStatusBadJSON;
+    NSDictionary* purgedDocs;
+    TDStatus status = [db purgeRevisions: body result: &purgedDocs];
+    if (TDStatusIsError(status))
         return status;
-    return [self update: db docID: nil json: _request.HTTPBody deleting: NO];
+    _response.bodyObject = $dict({@"purged", purgedDocs});
+    return status;
 }
 
 
 - (TDStatus) do_GET_all_docs: (TDDatabase*)db {
+    if ([self cacheWithEtag: $sprintf(@"%lld", db.lastSequence)])
+        return kTDStatusNotModified;
+    
     TDQueryOptions options;
     if (![self getQueryOptions: &options])
-        return 400;
+        return kTDStatusBadParam;
     NSDictionary* result = [db getAllDocs: &options];
     if (!result)
-        return 500;
+        return kTDStatusDBError;
     _response.bodyObject = result;
-    return 200;
+    return kTDStatusOK;
 }
 
 
@@ -238,20 +240,20 @@
     // http://wiki.apache.org/couchdb/HTTP_Bulk_Document_API
     TDQueryOptions options;
     if (![self getQueryOptions: &options])
-        return 400;
+        return kTDStatusBadParam;
     
     NSDictionary* body = self.bodyAsDictionary;
     if (!body)
-        return 400;
+        return kTDStatusBadJSON;
     NSArray* docIDs = [body objectForKey: @"keys"];
     if (![docIDs isKindOfClass: [NSArray class]])
-        return 400;
+        return kTDStatusBadParam;
     
     NSDictionary* result = [db getDocsWithIDs: docIDs options: &options];
     if (!result)
-        return 500;
+        return kTDStatusDBError;
     _response.bodyObject = result;
-    return 200;
+    return kTDStatusOK;
 }
 
 
@@ -260,7 +262,7 @@
     NSDictionary* body = self.bodyAsDictionary;
     NSArray* docs = $castIf(NSArray, [body objectForKey: @"docs"]);
     if (!docs)
-        return 400;
+        return kTDStatusBadParam;
     id allObj = [body objectForKey: @"all_or_nothing"];
     BOOL allOrNothing = (allObj && allObj != $false);
     BOOL noNewEdits = ([body objectForKey: @"new_edits"] == $false);
@@ -278,7 +280,7 @@
                 if (noNewEdits) {
                     rev = [[[TDRevision alloc] initWithBody: docBody] autorelease];
                     NSArray* history = [TDDatabase parseCouchDBRevisionHistory: doc];
-                    status = rev ? [db forceInsert: rev revisionHistory: history source: nil] : 400;
+                    status = rev ? [db forceInsert: rev revisionHistory: history source: nil] : kTDStatusBadParam;
                 } else {
                     status = [self update: db
                                     docID: docID
@@ -294,9 +296,9 @@
                         result = $dict({@"id", rev.docID}, {@"rev", rev.revID}, {@"ok", $true});
                 } else if (allOrNothing) {
                     return status;  // all_or_nothing backs out if there's any error
-                } else if (status == 403) {
+                } else if (status == kTDStatusForbidden) {
                     result = $dict({@"id", docID}, {@"error", @"validation failed"});
-                } else if (status == 409) {
+                } else if (status == kTDStatusConflict) {
                     result = $dict({@"id", docID}, {@"error", @"conflict"});
                 } else {
                     return status;  // abort the whole thing if something goes badly wrong
@@ -311,7 +313,7 @@
     }
     
     _response.bodyObject = results;
-    return 201;
+    return kTDStatusCreated;
 }
 
 
@@ -321,11 +323,11 @@
     TDRevisionList* revs = [[[TDRevisionList alloc] init] autorelease];
     NSDictionary* body = self.bodyAsDictionary;
     if (!body)
-        return 400;
+        return kTDStatusBadJSON;
     for (NSString* docID in body) {
         NSArray* revIDs = [body objectForKey: docID];
         if (![revIDs isKindOfClass: [NSArray class]])
-            return 400;
+            return kTDStatusBadParam;
         for (NSString* revID in revIDs) {
             TDRevision* rev = [[TDRevision alloc] initWithDocID: docID revID: revID deleted: NO];
             [revs addRev: rev];
@@ -335,7 +337,7 @@
     
     // Look them up, removing the existing ones from revs:
     if (![db findMissingRevisions: revs])
-        return 500;
+        return kTDStatusDBError;
     
     // Return the missing revs in a somewhat different format:
     NSMutableDictionary* diffs = $mdict();
@@ -344,23 +346,42 @@
         NSMutableArray* revs = [[diffs objectForKey: docID] objectForKey: @"missing"];
         if (!revs) {
             revs = $marray();
-            [diffs setObject: $dict({@"missing", revs}) forKey: docID];
+            [diffs setObject: $mdict({@"missing", revs}) forKey: docID];
         }
         [revs addObject: rev.revID];
     }
+    
+    // Add the possible ancestors for each missing revision:
+    for (NSString* docID in diffs) {
+        NSMutableDictionary* docInfo = [diffs objectForKey: docID];
+        int maxGen = 0;
+        NSString* maxRevID = nil;
+        for (NSString* revID in [docInfo objectForKey: @"missing"]) {
+            int gen;
+            if ([TDRevision parseRevID: revID intoGeneration: &gen andSuffix: NULL] && gen > maxGen) {
+                maxGen = gen;
+                maxRevID = revID;
+            }
+        }
+        TDRevision* rev = [[TDRevision alloc] initWithDocID: docID revID: maxRevID deleted: NO];
+        NSArray* ancestors = [_db getPossibleAncestorRevisionIDs: rev limit: 0];
+        [rev release];
+        if (ancestors)
+            [docInfo setObject: ancestors forKey: @"possible_ancestors"];
+    }
                                     
     _response.bodyObject = diffs;
-    return 200;
+    return kTDStatusOK;
 }
 
 
 - (TDStatus) do_POST_compact: (TDDatabase*)db {
     TDStatus status = [db compact];
-    return status<300 ? 202 : status;       // CouchDB returns 202 'cause it's an async operation
+    return status<300 ? kTDStatusAccepted : status;   // CouchDB returns 202 'cause it's async
 }
 
 - (TDStatus) do_POST_ensure_full_commit: (TDDatabase*)db {
-    return 200;
+    return kTDStatusOK;
 }
 
 
@@ -410,10 +431,11 @@
 
 - (void) sendContinuousChange: (TDRevision*)rev {
     NSDictionary* changeDict = [self changeDictForRev: rev];
-    NSMutableData* json = [[NSJSONSerialization dataWithJSONObject: changeDict
-                                                           options: 0 error: nil] mutableCopy];
+    NSMutableData* json = [[TDJSON dataWithJSONObject: changeDict
+                                              options: 0 error: NULL] mutableCopy];
     [json appendBytes: "\n" length: 1];
-    _onDataAvailable(json);
+    if (_onDataAvailable)
+        _onDataAvailable(json, NO);
     [json release];
 }
 
@@ -428,10 +450,10 @@
         Log(@"TDRouter: Sending longpoll response");
         [self sendResponse];
         NSDictionary* body = [self responseBodyForChanges: $array(rev) since: 0];
-        _onDataAvailable([NSJSONSerialization dataWithJSONObject: body
-                                                         options: 0 error: nil]);
-        _onFinished();
-        [self stop];
+        _response.body = [TDBody bodyWithProperties: body];
+        if (_onDataAvailable)
+            _onDataAvailable(_response.body.asJSON, YES);
+        [self finished];
     } else {
         Log(@"TDRouter: Sending continous change chunk");
         [self sendContinuousChange: rev];
@@ -441,6 +463,16 @@
 
 - (TDStatus) do_GET_changes: (TDDatabase*)db {
     // http://wiki.apache.org/couchdb/HTTP_database_API#Changes
+    
+    NSString* feed = [self query: @"feed"];
+    _longpoll = $equal(feed, @"longpoll");
+    BOOL continuous = !_longpoll && $equal(feed, @"continuous");
+    
+    // Regular poll is cacheable:
+    if (!_longpoll && !continuous && [self cacheWithEtag: $sprintf(@"%lld", _db.lastSequence)])
+        return kTDStatusNotModified;
+
+    // Get options:
     TDChangesOptions options = kDefaultTDChangesOptions;
     _changesIncludeDocs = [self boolQuery: @"include_docs"];
     options.includeDocs = _changesIncludeDocs;
@@ -454,20 +486,18 @@
     if (filterName) {
         _changesFilter = [[_db filterNamed: filterName] retain];
         if (!_changesFilter)
-            return 404;
+            return kTDStatusNotFound;
     }
     
     TDRevisionList* changes = [db changesSinceSequence: since
                                                options: &options
                                                 filter: _changesFilter];
     if (!changes)
-        return 500;
+        return kTDStatusDBError;
     
-    NSString* feed = [self query: @"feed"];
-    _longpoll = $equal(feed, @"longpoll");
-    BOOL continuous = !_longpoll && $equal(feed, @"continuous");
     
     if (continuous || (_longpoll && changes.count==0)) {
+        // Response is going to stay open (continuous, or hanging GET):
         if (continuous) {
             [self sendResponse];
             for (TDRevision* rev in changes) 
@@ -481,12 +511,13 @@
         _waiting = YES;
         return 0;
     } else {
+        // Return a response immediately and close the connection:
         if (options.includeConflicts)
             _response.bodyObject = [self responseBodyForChangesWithConflicts: changes.allRevisions
                                                                        since: since];
         else
             _response.bodyObject = [self responseBodyForChanges: changes.allRevisions since: since];
-        return 200;
+        return kTDStatusOK;
     }
 }
 
@@ -494,22 +525,14 @@
 #pragma mark - DOCUMENT REQUESTS:
 
 
-- (NSString*) revIDFromIfMatchHeader {
-    NSString* ifMatch = [_request valueForHTTPHeaderField: @"If-Match"];
-    if (!ifMatch)
+static NSArray* parseJSONRevArrayQuery(NSString* queryStr) {
+    queryStr = [queryStr stringByReplacingPercentEscapesUsingEncoding: NSUTF8StringEncoding];
+    if (!queryStr)
         return nil;
-    // Value of If-Match is an ETag, so have to trim the quotes around it:
-    if (ifMatch.length > 2 && [ifMatch hasPrefix: @"\""] && [ifMatch hasSuffix: @"\""])
-        return [ifMatch substringWithRange: NSMakeRange(1, ifMatch.length-2)];
-    else
-        return nil;
-}
-
-
-- (NSString*) setResponseEtag: (TDRevision*)rev {
-    NSString* eTag = $sprintf(@"\"%@\"", rev.revID);
-    [_response setValue: eTag ofHeader: @"Etag"];
-    return eTag;
+    NSData* queryData = [queryStr dataUsingEncoding: NSUTF8StringEncoding];
+    return $castIfArrayOf(NSString, [TDJSON JSONObjectWithData: queryData
+                                                       options: 0
+                                                         error: NULL]);
 }
 
 
@@ -517,21 +540,42 @@
     // http://wiki.apache.org/couchdb/HTTP_Document_API#GET
     BOOL isLocalDoc = [docID hasPrefix: @"_local/"];
     TDContentOptions options = [self contentOptions];
+    NSString* acceptMultipart = self.multipartRequestType;
     NSString* openRevsParam = [self query: @"open_revs"];
     if (openRevsParam == nil || isLocalDoc) {
         // Regular GET:
         NSString* revID = [self query: @"rev"];  // often nil
         TDRevision* rev;
-        if (isLocalDoc)
+        BOOL includeAttachments = NO;
+        if (isLocalDoc) {
             rev = [db getLocalDocumentWithID: docID revisionID: revID];
-        else
+        } else {
+            includeAttachments = (options & kTDIncludeAttachments) != 0;
+            if (acceptMultipart)
+                options &= ~kTDIncludeAttachments;
             rev = [db getDocumentWithID: docID revisionID: revID options: options];
+        }
+
         if (!rev)
-            return 404;
+            return kTDStatusNotFound;
         if ([self cacheWithEtag: rev.revID])        // set ETag and check conditional GET
-            return 304;
+            return kTDStatusNotModified;
         
-        _response.body = rev.body;
+        if (includeAttachments) {
+            int minRevPos = 1;
+            NSArray* attsSince = parseJSONRevArrayQuery([self query: @"atts_since"]);
+            NSString* ancestorID = [_db findCommonAncestorOf: rev withRevIDs: attsSince];
+            if (ancestorID)
+                minRevPos = [TDRevision generationFromRevID: ancestorID] + 1;
+            [TDDatabase stubOutAttachmentsIn: rev beforeRevPos: minRevPos
+                           attachmentsFollow: (acceptMultipart != nil)];
+        }
+
+        if (acceptMultipart)
+            [_response setMultipartBody: [db multipartWriterForRevision: rev
+                                                            contentType: acceptMultipart]];
+        else
+            _response.body = rev.body;
         
     } else {
         NSMutableArray* result;
@@ -543,7 +587,7 @@
                 TDStatus status = [_db loadRevisionBody: rev options: options];
                 if (status < 300)
                     [result addObject: $dict({@"ok", rev.properties})];
-                else if (status < 500)
+                else if (status < kTDStatusServerError)
                     [result addObject: $dict({@"missing", rev.revID})];
                 else
                     return status;  // internal error getting revision
@@ -551,13 +595,13 @@
                 
         } else {
             // ?open_revs=[...] returns an array of revisions of the document:
-            NSArray* openRevs = $castIf(NSArray, [self jsonQuery: @"open_revs" error: nil]);
+            NSArray* openRevs = $castIf(NSArray, [self jsonQuery: @"open_revs" error: NULL]);
             if (!openRevs)
-                return 400;
+                return kTDStatusBadParam;
             result = [NSMutableArray arrayWithCapacity: openRevs.count];
             for (NSString* revID in openRevs) {
                 if (![revID isKindOfClass: [NSString class]])
-                    return 400;
+                    return kTDStatusBadID;
                 TDRevision* rev = [db getDocumentWithID: docID revisionID: revID options: options];
                 if (rev)
                     [result addObject: $dict({@"ok", rev.properties})];
@@ -565,38 +609,43 @@
                     [result addObject: $dict({@"missing", revID})];
             }
         }
-        NSString* acceptMultipart = self.multipartRequestType;
         if (acceptMultipart)
             [_response setMultipartBody: result type: acceptMultipart];
         else
             _response.bodyObject = result;
     }
-    return 200;
+    return kTDStatusOK;
 }
 
 
 - (TDStatus) do_GET: (TDDatabase*)db docID: (NSString*)docID attachment: (NSString*)attachment {
-    //OPT: This gets the JSON body too, which is a waste. Could add a kNoBody option?
     TDRevision* rev = [db getDocumentWithID: docID
                                  revisionID: [self query: @"rev"]  // often nil
-                                    options: 0];
+                                    options: kTDNoBody];        // all we need is revID & sequence
     if (!rev)
-        return 404;
+        return kTDStatusNotFound;
     if ([self cacheWithEtag: rev.revID])        // set ETag and check conditional GET
-        return 304;
+        return kTDStatusNotModified;
     
     NSString* type = nil;
     TDStatus status;
+    TDAttachmentEncoding encoding = kTDAttachmentEncodingNone;
+    NSString* acceptEncoding = [_request valueForHTTPHeaderField: @"Accept-Encoding"];
+    BOOL acceptEncoded = (acceptEncoding && [acceptEncoding rangeOfString: @"gzip"].length > 0);
+    
     NSData* contents = [_db getAttachmentForSequence: rev.sequence
                                                named: attachment
                                                 type: &type
+                                            encoding: (acceptEncoded ? &encoding : NULL)
                                               status: &status];
     if (!contents)
         return status;
     if (type)
         [_response setValue: type ofHeader: @"Content-Type"];
+    if (encoding == kTDAttachmentEncodingGZIP)
+        [_response setValue: @"gzip" ofHeader: @"Content-Encoding"];
     _response.body = [TDBody bodyWithJSON: contents];   //FIX: This is a lie, it's not JSON
-    return 200;
+    return kTDStatusOK;
 }
 
 
@@ -607,21 +656,18 @@
       allowConflict: (BOOL)allowConflict
          createdRev: (TDRevision**)outRev
 {
-    BOOL isLocalDoc = [docID hasPrefix: @"_local/"];
+    if (body && !body.isValidJSON)
+        return kTDStatusBadJSON;
+    
     NSString* prevRevID;
     
     if (!deleting) {
         deleting = $castIf(NSNumber, [body propertyForKey: @"_deleted"]).boolValue;
         if (!docID) {
-            if (isLocalDoc)
-                return 405;  // method not allowed
-            // POST's doc ID may come from the _id field of the JSON body, else generate a random one.
+            // POST's doc ID may come from the _id field of the JSON body.
             docID = [body propertyForKey: @"_id"];
-            if (!docID) {
-                if (deleting)
-                    return 400;
-                docID = [TDDatabase generateDocumentID];
-            }
+            if (!docID && deleting)
+                return kTDStatusBadID;
         }
         // PUT's revision ID comes from the JSON body.
         prevRevID = [body propertyForKey: @"_rev"];
@@ -632,16 +678,16 @@
 
     // A backup source of revision ID is an If-Match header:
     if (!prevRevID)
-        prevRevID = [self revIDFromIfMatchHeader];
+        prevRevID = self.ifMatch;
 
     TDRevision* rev = [[[TDRevision alloc] initWithDocID: docID revID: nil deleted: deleting]
                             autorelease];
     if (!rev)
-        return 400;
+        return kTDStatusBadID;
     rev.body = body;
     
     TDStatus status;
-    if (isLocalDoc)
+    if ([docID hasPrefix: @"_local/"])
         *outRev = [db putLocalRevision: rev prevRevisionID: prevRevID status: &status];
     else
         *outRev = [db putRevision: rev prevRevisionID: prevRevID
@@ -653,10 +699,9 @@
 
 - (TDStatus) update: (TDDatabase*)db
               docID: (NSString*)docID
-               json: (NSData*)json
+               body: (TDBody*)body
            deleting: (BOOL)deleting
 {
-    TDBody* body = json ? [TDBody bodyWithJSON: json] : nil;
     TDRevision* rev;
     TDStatus status = [self update: db docID: docID body: body
                           deleting: deleting
@@ -677,20 +722,44 @@
     return status;
 }
 
+
+- (TDBody*) documentBodyFromRequest: (TDStatus*)outStatus {
+    NSString* contentType = [_request valueForHTTPHeaderField: @"Content-Type"];
+    NSDictionary* properties = [TDMultipartDocumentReader readData: _request.HTTPBody
+                                                            ofType: contentType
+                                                        toDatabase: _db
+                                                            status: outStatus];
+    return properties ? [TDBody bodyWithProperties: properties] : nil;
+}
+
+
+- (TDStatus) do_POST: (TDDatabase*)db {
+    TDStatus status = [self openDB];
+    if (TDStatusIsError(status))
+        return status;
+    TDBody* body = [self documentBodyFromRequest: &status];
+    if (!body)
+        return status;
+    return [self update: db docID: nil body: body deleting: NO];
+}
+
+
 - (TDStatus) do_PUT: (TDDatabase*)db docID: (NSString*)docID {
-    NSData* json = _request.HTTPBody;
-    if (!json)
-        return 400;
+    TDStatus status;
+    TDBody* body = [self documentBodyFromRequest: &status];
+    if (!body)
+        return status;
     
     if (![self query: @"new_edits"] || [self boolQuery: @"new_edits"]) {
         // Regular PUT:
-        return [self update: db docID: docID json: json deleting: NO];
+        return [self update: db docID: docID body: body deleting: NO];
     } else {
         // PUT with new_edits=false -- forcible insertion of existing revision:
-        TDBody* body =  [TDBody bodyWithJSON: json];
         TDRevision* rev = [[[TDRevision alloc] initWithBody: body] autorelease];
-        if (!rev || !$equal(rev.docID, docID) || !rev.revID)
-            return 400;
+        if (!rev)
+            return kTDStatusBadJSON;
+        if (!$equal(rev.docID, docID) || !rev.revID)
+            return kTDStatusBadID;
         NSArray* history = [TDDatabase parseCouchDBRevisionHistory: body.properties];
         return [_db forceInsert: rev revisionHistory: history source: nil];
     }
@@ -698,7 +767,7 @@
 
 
 - (TDStatus) do_DELETE: (TDDatabase*)db docID: (NSString*)docID {
-    return [self update: db docID: docID json: nil deleting: YES];
+    return [self update: db docID: docID body: nil deleting: YES];
 }
 
 
@@ -707,8 +776,9 @@
     TDRevision* rev = [_db updateAttachment: attachment 
                                        body: body
                                        type: [_request valueForHTTPHeaderField: @"Content-Type"]
+                                   encoding: kTDAttachmentEncodingNone
                                     ofDocID: docID
-                                      revID: ([self query: @"rev"] ?: [self revIDFromIfMatchHeader])
+                                      revID: ([self query: @"rev"] ?: self.ifMatch)
                                      status: &status];
     if (status < 300) {
         _response.bodyObject = $dict({@"ok", $true}, {@"id", rev.docID}, {@"rev", rev.revID});
@@ -776,25 +846,25 @@
         TDRevision* rev = [_db getDocumentWithID: [@"_design/" stringByAppendingString: designDoc]
                                       revisionID: nil options: 0];
         if (!rev)
-            return 404;
+            return kTDStatusNotFound;
         NSDictionary* views = $castIf(NSDictionary, [rev.properties objectForKey: @"views"]);
         NSDictionary* viewProps = $castIf(NSDictionary, [views objectForKey: viewName]);
         if (!viewProps)
-            return 404;
+            return kTDStatusNotFound;
         // If there is a CouchDB view, see if it can be compiled from source:
         view = [self compileView: tdViewName fromProperties: viewProps];
         if (!view)
-            return 500;
+            return kTDStatusDBError;
     }
     
     TDQueryOptions options;
     if (![self getQueryOptions: &options])
-        return 400;
+        return kTDStatusBadRequest;
     if (keys)
         options.keys = keys;
     
     TDStatus status = [view updateIndex];
-    if (status >= 400)
+    if (status >= kTDStatusBadRequest)
         return status;
     SequenceNumber lastSequenceIndexed = view.lastSequenceIndexed;
     
@@ -802,7 +872,7 @@
     if (!keys) {
         SequenceNumber eTag = options.includeDocs ? _db.lastSequence : lastSequenceIndexed;
         if ([self cacheWithEtag: $sprintf(@"%lld", eTag)])
-            return 304;
+            return kTDStatusNotModified;
     }
 
     NSArray* rows = [view queryWithOptions: &options status: &status];
@@ -813,7 +883,7 @@
                                  {@"total_rows", $object(rows.count)},
                                  {@"offset", $object(options.skip)},
                                  {@"update_seq", updateSeq});
-    return 200;
+    return kTDStatusOK;
 }
 
 
@@ -825,32 +895,34 @@
 - (TDStatus) do_POST: (TDDatabase*)db designDocID: (NSString*)designDoc view: (NSString*)viewName {
     NSArray* keys = $castIf(NSArray, [self.bodyAsDictionary objectForKey: @"keys"]);
     if (!keys)
-        return 400;
+        return kTDStatusBadParam;
     return [self queryDesignDoc: designDoc view: viewName keys: keys];
 }
 
 
 - (TDStatus) do_POST_temp_view: (TDDatabase*)db {
     if (![[_request valueForHTTPHeaderField: @"Content-Type"] hasPrefix: @"application/json"])
-        return 415;
+        return kTDStatusUnsupportedType;
     TDBody* requestBody = [TDBody bodyWithJSON: _request.HTTPBody];
+    if (!requestBody.isValidJSON)
+        return kTDStatusBadJSON;
     NSDictionary* props = requestBody.properties;
     if (!props)
-        return 400;
+        return kTDStatusBadJSON;
     
     TDQueryOptions options;
     if (![self getQueryOptions: &options])
-        return 400;
+        return kTDStatusBadRequest;
     
     if ([self cacheWithEtag: $sprintf(@"%lld", _db.lastSequence)])  // conditional GET
-        return 304;
+        return kTDStatusNotModified;
 
     TDView* view = [self compileView: @"@@TEMP@@" fromProperties: props];
     if (!view)
-        return 500;
+        return kTDStatusDBError;
     @try {
         TDStatus status = [view updateIndex];
-        if (status >= 400)
+        if (status >= kTDStatusBadRequest)
             return status;
         if (view.reduceBlock)
             options.reduce = YES;
@@ -862,7 +934,7 @@
                                      {@"total_rows", $object(rows.count)},
                                      {@"offset", $object(options.skip)},
                                      {@"update_seq", updateSeq});
-        return 200;
+        return kTDStatusOK;
     } @finally {
         [view deleteView];
     }

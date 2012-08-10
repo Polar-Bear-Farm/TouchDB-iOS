@@ -15,24 +15,24 @@
 
 #import <Foundation/Foundation.h>
 @class TDChangeTracker;
+@protocol TDAuthorizer;
 
 
 @protocol TDChangeTrackerClient <NSObject>
 - (void) changeTrackerReceivedChange: (NSDictionary*)change;
 @optional
-- (NSURLCredential*) authCredential;
 - (void) changeTrackerStopped: (TDChangeTracker*)tracker;
 @end
 
 
 typedef enum TDChangeTrackerMode {
     kOneShot,
-    kLongPoll,
-    kContinuous
+    kLongPoll
 } TDChangeTrackerMode;
 
 
-/** Reads the continuous-mode _changes feed of a database, and sends the individual change entries to its client's -changeTrackerReceivedChange:. */
+/** Reads the continuous-mode _changes feed of a database, and sends the individual change entries to its client's -changeTrackerReceivedChange:. 
+    This class is abstract. Instantiate TDConnectionChangeTracker instead. */
 @interface TDChangeTracker : NSObject <NSStreamDelegate>
 {
     @protected
@@ -40,35 +40,51 @@ typedef enum TDChangeTrackerMode {
     id<TDChangeTrackerClient> _client;
     TDChangeTrackerMode _mode;
     id _lastSequenceID;
+    unsigned _limit;
     NSError* _error;
+    BOOL _includeConflicts;
     NSString* _filterName;
     NSDictionary* _filterParameters;
+    NSTimeInterval _heartbeat;
+    NSDictionary* _requestHeaders;
+    id<TDAuthorizer> _authorizer;
+    unsigned _retryCount;
 }
 
 - (id)initWithDatabaseURL: (NSURL*)databaseURL
                      mode: (TDChangeTrackerMode)mode
+                conflicts: (BOOL)includeConflicts
              lastSequence: (id)lastSequenceID
                    client: (id<TDChangeTrackerClient>)client;
 
 @property (readonly, nonatomic) NSURL* databaseURL;
 @property (readonly, nonatomic) NSString* databaseName;
+@property (readonly) NSURL* changesFeedURL;
 @property (readonly, nonatomic) TDChangeTrackerMode mode;
 @property (readonly, copy, nonatomic) id lastSequenceID;
 @property (retain, nonatomic) NSError* error;
 @property (assign, nonatomic) id<TDChangeTrackerClient> client;
+@property (retain, nonatomic) NSDictionary *requestHeaders;
+@property (retain, nonatomic) id<TDAuthorizer> authorizer;
 
 @property (copy) NSString* filterName;
 @property (copy) NSDictionary* filterParameters;
+@property (nonatomic) unsigned limit;
+@property (nonatomic) NSTimeInterval heartbeat;
 
 - (BOOL) start;
 - (void) stop;
 
+/** Asks the tracker to retry connecting, _if_ it's currently disconnected but waiting to retry.
+    This should be called when the reachability of the remote host changes, or when the
+    app is reactivated. */
+- (void) retry;
+
 // Protected
-@property (readonly) NSURLCredential* authCredential;
-@property (readonly) NSURL* changesFeedURL;
 @property (readonly) NSString* changesFeedPath;
-- (void) receivedChunk: (NSData*)chunk;
-- (BOOL) receivedPollResponse: (NSData*)body;
+- (void) setUpstreamError: (NSString*)message;
+- (void) failedWithError: (NSError*)error;
+- (NSInteger) receivedPollResponse: (NSData*)body;
 - (void) stopped; // override this
 
 @end

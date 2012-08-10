@@ -16,6 +16,7 @@
 #import "DemoAppController.h"
 #import "DemoQuery.h"
 #import "Test.h"
+#import "MYBlockUtils.h"
 #import <CouchCocoa/CouchCocoa.h>
 #import <CouchCocoa/CouchTouchDBServer.h>
 #import <CouchCocoa/CouchDesignDocument_Embedded.h>
@@ -46,7 +47,7 @@ int main (int argc, const char * argv[]) {
 
 - (void) applicationDidFinishLaunching: (NSNotification*)n {
     //gRESTLogLevel = kRESTLogRequestURLs;
-    //gCouchLogLevel = 1;
+    gCouchLogLevel = 1;
     
     NSDictionary* bundleInfo = [[NSBundle mainBundle] infoDictionary];
     NSString* dbName = [bundleInfo objectForKey: @"DemoDatabase"];
@@ -96,37 +97,25 @@ int main (int argc, const char * argv[]) {
     self.query = [[[DemoQuery alloc] initWithQuery: q] autorelease];
     self.query.modelClass =_tableController.objectClass;
     
-    // Enable continuous sync:
+    // Start watching any persistent replications already configured:
     [self startContinuousSyncWith: self.syncURL];
     
 #ifdef FOR_TESTING_PURPOSES
     // Start a listener socket:
-    sListener = [[TDListener alloc] initWithTDServer: server.touchServer port: 8888];
-    [sListener start];
+    [server tellTDServer: ^(TDServer* tdServer) {
+        // Register support for handling certain JS functions used in the CouchDB unit tests:
+        [TDView setCompiler: self];
+        
+        sListener = [[TDListener alloc] initWithTDServer: tdServer port: 8888];
+        [sListener start];
+    }];
 
-    // Register support for handling certain JS functions used in the CouchDB unit tests:
-    [TDView setCompiler: self];
 #endif
 }
 
 
 
-#pragma mark - SYNC:
-
-
-- (NSURL*) syncURL {
-    NSString* urlStr = [[NSUserDefaults standardUserDefaults] stringForKey: @"SyncURL"];
-    return urlStr ? [NSURL URLWithString: urlStr] : nil;
-}
-
-- (void) setSyncURL:(NSURL *)url {
-    NSURL* currentURL = self.syncURL;
-    if (url != currentURL && ![url isEqual: currentURL]) {
-        [[NSUserDefaults standardUserDefaults] setObject: url.absoluteString
-                                                  forKey: @"SyncURL"];
-        [self startContinuousSyncWith: url];
-    }
-}
+#pragma mark - SYNC UI:
 
 
 - (NSURL*) currentURLFromField {
@@ -184,52 +173,144 @@ int main (int argc, const char * argv[]) {
     if (_syncConfiguringDefault) {
         self.syncURL = url;
     } else {
+        /* FIX: Re-enable this functionality once CouchReplication/CouchPersistentReplication
+                 are merged
         if (_syncPushCheckbox.state) {
             NSLog(@"**** Pushing to <%@> ...", url);
-            [_database pushToDatabaseAtURL: url options: 0];
+            [self observeReplication: [_database pushToDatabaseAtURL: url]];
         }
         if (_syncPullCheckbox.state) {
             NSLog(@"**** Pulling from <%@> ...", url);
-            [_database pullFromDatabaseAtURL: url options: 0];
+            [self observeReplication: [_database pullFromDatabaseAtURL: url]];
         }
+         */
     }
 }
 
 
-- (void) stopReplication: (CouchReplication**)repl {
-    [*repl removeObserver: self forKeyPath: @"completed"];
-    [*repl stop];
-    [*repl release];
-    *repl = nil;
+#pragma mark - SYNC:
+
+
+- (NSURL*) syncURL {
+    NSString* urlStr = [[NSUserDefaults standardUserDefaults] stringForKey: @"SyncURL"];
+    return urlStr ? [NSURL URLWithString: urlStr] : nil;
+}
+
+- (void) setSyncURL:(NSURL *)url {
+    NSURL* currentURL = self.syncURL;
+    if (url != currentURL && ![url isEqual: currentURL]) {
+        [[NSUserDefaults standardUserDefaults] setObject: url.absoluteString
+                                                  forKey: @"SyncURL"];
+        [self startContinuousSyncWith: url];
+    }
+}
+
+
+- (void) observeReplication: (CouchPersistentReplication*)repl {
+    [repl addObserver: self forKeyPath: @"completed" options: 0 context: NULL];
+    [repl addObserver: self forKeyPath: @"total" options: 0 context: NULL];
+    [repl addObserver: self forKeyPath: @"error" options: 0 context: NULL];
+    [repl addObserver: self forKeyPath: @"mode" options: 0 context: NULL];
+}
+
+- (void) stopObservingReplication: (CouchPersistentReplication*)repl {
+    [repl removeObserver: self forKeyPath: @"completed"];
+    [repl removeObserver: self forKeyPath: @"total"];
+    [repl removeObserver: self forKeyPath: @"error"];
+    [repl removeObserver: self forKeyPath: @"mode"];
+}
+
+- (void) forgetReplication: (CouchPersistentReplication**)repl {
+    if (*repl) {
+        [self stopObservingReplication: *repl];
+        [*repl release];
+        *repl = nil;
+    }
 }
 
 
 - (void) startContinuousSyncWith: (NSURL*)otherDbURL {
-    [self stopReplication: &_pull];
-    [self stopReplication: &_push];
-    if (otherDbURL) {
-        _pull = [[_database pullFromDatabaseAtURL: otherDbURL options: kCouchReplicationContinuous]
-                    retain];
-        [_pull addObserver: self forKeyPath: @"completed" options: 0 context: NULL];
+    [self forgetReplication: &_pull];
+    [self forgetReplication: &_push];
+    
+    NSArray* repls = [_database replicateWithURL: otherDbURL exclusively: YES];
+    _pull = [[repls objectAtIndex: 0] retain];
+    _push = [[repls objectAtIndex: 1] retain];
+    [self observeReplication: _pull];
+    [self observeReplication: _push];
+    
+    _syncHostField.stringValue = otherDbURL ? $sprintf(@"⇄ %@", otherDbURL.host) : @"";
+}
 
-        _push = [[_database pushToDatabaseAtURL: otherDbURL options: kCouchReplicationContinuous]
-                    retain];
-        [_push addObserver: self forKeyPath: @"completed" options: 0 context: NULL];
+
+- (void) updateSyncStatusView {
+    int value;
+    NSString* tooltip = nil;
+    if (_pull.error) {
+        value = 3;  // red
+        tooltip = _pull.error.localizedDescription;
+    } else if (_push.error) {
+        value = 3;  // red
+        tooltip = _push.error.localizedDescription;
+    } else switch(MAX(_pull.mode, _push.mode)) {
+        case kCouchReplicationStopped:
+            value = 3; 
+            tooltip = @"Sync stopped";
+            break;  // red
+        case kCouchReplicationOffline:
+            value = 2;  // yellow
+            tooltip = @"Offline";
+            break;
+        case kCouchReplicationIdle:
+            value = 0;
+            tooltip = @"Everything's in sync!";
+            break;
+        case kCouchReplicationActive:
+            value = 1;
+            tooltip = @"Syncing data...";
+            break;
+        default:
+            NSAssert(NO, @"Illegal mode");
+            break;
     }
+    _syncStatusView.intValue = value;
+    _syncStatusView.toolTip = tooltip;
 }
 
 
 - (void) observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object 
                          change:(NSDictionary *)change context:(void *)context
 {
-    if (object == _pull || object == _push) {
-        unsigned completed = _pull.completed + _push.completed;
-        unsigned total = _pull.total + _push.total;
-        NSLog(@"SYNC progress: %u / %u", completed, total);
-        if (total > 0 && completed < total) {
-            [_syncProgress setDoubleValue: (completed / (double)total)];
-        } else {
-            [_syncProgress setDoubleValue: 0.0];
+    CouchPersistentReplication* repl = object;
+    if ([keyPath isEqualToString: @"completed"] || [keyPath isEqualToString: @"total"]) {
+        if (repl == _pull || repl == _push) {
+            unsigned completed = _pull.completed + _push.completed;
+            unsigned total = _pull.total + _push.total;
+            NSLog(@"SYNC progress: %u / %u", completed, total);
+            if (total > 0 && completed < total) {
+                [_syncProgress setDoubleValue: (completed / (double)total)];
+            } else {
+                [_syncProgress setDoubleValue: 0.0];
+            }
+        }
+    } else if ([keyPath isEqualToString: @"mode"]) {
+        [self updateSyncStatusView];
+    } else if ([keyPath isEqualToString: @"error"]) {
+        [self updateSyncStatusView];
+        if (repl.error) {
+            NSAlert* alert = [NSAlert alertWithMessageText: @"Replication failed"
+                                             defaultButton: nil
+                                           alternateButton: nil
+                                               otherButton: nil
+                                 informativeTextWithFormat: @"Replication with %@ failed.\n\n %@",
+                              repl.remoteURL, repl.error.localizedDescription];
+            [alert beginSheetModalForWindow: _window
+                              modalDelegate: nil didEndSelector: NULL contextInfo: NULL];
+        }
+    } else if ([keyPath isEqualToString: @"running"]) {
+        if (repl != _push && repl != _pull) {
+            // end of a 1-shot replication
+            [self stopObservingReplication: repl];
         }
     }
 }
@@ -279,12 +360,6 @@ int main (int argc, const char * argv[]) {
 #pragma mark HIGHLIGHTING NEW ITEMS:
 
 
-- (void) updateTableGlows {
-    _glowing = NO;
-    [_table setNeedsDisplay: YES];
-}
-
-
 - (void)tableView:(NSTableView *)tableView
   willDisplayCell:(id)cell
    forTableColumn:(NSTableColumn *)tableColumn
@@ -307,7 +382,10 @@ int main (int argc, const char * argv[]) {
         
         if (!_glowing) {
             _glowing = YES;
-            [self performSelector: @selector(updateTableGlows) withObject: nil afterDelay: 0.1];
+            MYAfterDelay(0.1, ^{
+                _glowing = NO;
+                [_table setNeedsDisplay: YES];
+            });
         }
     }
     

@@ -14,25 +14,35 @@
 //  and limitations under the License.
 
 #import "TDPusher.h"
-#import "TDDatabase.h"
-#import "TDRevision.h"
+#import <TouchDB/TDDatabase.h>
+#import "TDDatabase+Insertion.h"
+#import <TouchDB/TDRevision.h>
+#import "TDMultipartUploader.h"
 #import "TDInternal.h"
+#import "TDMisc.h"
+
+
+static int findCommonAncestor(TDRevision* rev, NSArray* possibleIDs);
+
+
+@interface TDPusher ()
+- (BOOL) uploadMultipartRevision: (TDRevision*)rev;
+@end
 
 
 @implementation TDPusher
 
 
-@synthesize createTarget=_createTarget, filter=_filter;
-
-
-- (void)dealloc {
-    [_filter release];
-    [super dealloc];
-}
+@synthesize createTarget=_createTarget;
 
 
 - (BOOL) isPush {
     return YES;
+}
+
+
+- (TDFilterBlock) filter {
+    return _filterName ? [_db filterNamed: _filterName] : NULL;
 }
 
 
@@ -41,16 +51,18 @@
     if (!_createTarget)
         return;
     LogTo(Sync, @"Remote db might not exist; creating it...");
+    [self asyncTaskStarted];
     [self sendAsyncRequest: @"PUT" path: @"" body: nil onCompletion: ^(id result, NSError* error) {
-        if (error && error.code != 412) {
+        if (error && error.code != kTDStatusDuplicate) {
             LogTo(Sync, @"Failed to create remote db: %@", error);
             self.error = error;
             [self stop];
         } else {
             LogTo(Sync, @"Created remote db");
-            _createTarget = NO;
+            _createTarget = NO;             // remember that I created the target
             [self beginReplicating];
         }
+        [self asyncTasksFinished: 1];
     }];
 }
 
@@ -61,9 +73,16 @@
     if (_createTarget)
         return;
     
+    TDFilterBlock filter = self.filter;
+    if (!filter && _filterName)
+        Warn(@"%@: No TDFilterBlock registered for filter '%@'; ignoring", self, _filterName);
+    
+    // Include conflicts so all conflicting revisions are replicated too
+    TDChangesOptions options = kDefaultTDChangesOptions;
+    options.includeConflicts = YES;
     // Process existing changes since the last push:
     TDRevisionList* changes = [_db changesSinceSequence: [_lastSequence longLongValue] 
-                                                options: nil filter: _filter];
+                                                options: &options filter: filter];
     if (changes.count > 0)
         [self processInbox: changes];
     
@@ -72,18 +91,33 @@
         _observing = YES;
         [[NSNotificationCenter defaultCenter] addObserver: self selector: @selector(dbChanged:)
                                                      name: TDDatabaseChangeNotification object: _db];
-        [self asyncTaskStarted];  // prevents -stopped from being called when other tasks finish
     }
 }
 
-- (void) stop {
+
+- (void) stopObserving {
     if (_observing) {
         _observing = NO;
-        [[NSNotificationCenter defaultCenter] removeObserver: self];
-        [self asyncTasksFinished: 1];
+        [[NSNotificationCenter defaultCenter] removeObserver: self
+                                                        name: TDDatabaseChangeNotification
+                                                      object: _db];
     }
+}
+
+- (BOOL) goOffline {
+    if (![super goOffline])
+        return NO;
+    [self stopObserving];
+    return YES;
+}
+
+- (void) stop {
+    setObj(&_uploaderQueue, nil);
+    _uploading = NO;
+    [self stopObserving];
     [super stop];
 }
+
 
 - (void) dbChanged: (NSNotification*)n {
     NSDictionary* userInfo = n.userInfo;
@@ -91,14 +125,16 @@
     if ([[userInfo objectForKey: @"source"] isEqual: _remote])
         return;
     TDRevision* rev = [userInfo objectForKey: @"rev"];
-    if (!_filter || _filter(rev))
-        [self addToInbox: rev];
+    TDFilterBlock filter = self.filter;
+    if (filter && !filter(rev))
+        return;
+    [self addToInbox: rev];
 }
 
 
 - (void) processInbox: (TDRevisionList*)changes {
-    SequenceNumber lastInboxSequence = [changes.allRevisions.lastObject sequence];
     // Generate a set of doc/rev IDs in the JSON format that _revs_diff wants:
+    // <http://wiki.apache.org/couchdb/HttpPostRevsDiff>
     NSMutableDictionary* diffs = $mdict();
     for (TDRevision* rev in changes) {
         NSString* docID = rev.docID;
@@ -120,29 +156,44 @@
         } else if (results.count) {
             // Go through the list of local changes again, selecting the ones the destination server
             // said were missing and mapping them to a JSON dictionary in the form _bulk_docs wants:
-            NSArray* docsToSend = [changes.allRevisions my_map: ^(id rev) {
-                NSMutableDictionary* properties;
+            __block SequenceNumber lastInboxSequence = 0;
+            NSArray* docsToSend = [changes.allRevisions my_map: ^id(TDRevision* rev) {
+                NSDictionary* properties;
                 @autoreleasepool {
-                    NSArray* revs = [[results objectForKey: [rev docID]] objectForKey: @"missing"];
-                    if (![revs containsObject: [rev revID]])
-                        return (id)nil;
-                    // Get the revision's properties:
-                    if ([rev deleted])
-                        properties = [$mdict({@"_id", [rev docID]}, {@"_rev", [rev revID]}, 
-                                             {@"_deleted", $true}) retain];
-                    else {
-                        // OPT: Shouldn't include all attachment bodies, just ones that have changed
-                        // OPT: Should send docs with many or big attachments as multipart/related
-                        if (![_db loadRevisionBody: rev options: kTDIncludeAttachments]) {
-                            Warn(@"%@: Couldn't get local contents of %@", self, rev);
-                            return nil;
-                        }
-                        properties = [[rev properties] mutableCopy];
-                    }
+                    // Is this revision in the server's 'missing' list?
+                    NSDictionary* revResults = [results objectForKey: [rev docID]];
+                    NSArray* missing = [revResults objectForKey: @"missing"];
+                    if (![missing containsObject: [rev revID]])
+                        return nil;
                     
-                    // Add the _revisions list:
-                    [properties setValue: [_db getRevisionHistoryDict: rev] forKey: @"_revisions"];
+                    // Get the revision's properties:
+                    TDContentOptions options = kTDIncludeAttachments | kTDIncludeRevs
+                                                                     | kTDBigAttachmentsFollow;
+#ifdef GNUSTEP
+                    options &= ~kTDBigAttachmentsFollow;    // TODO: Multipart upload on GNUstep
+#endif
+                    if ([_db loadRevisionBody: rev options: options] >= 300) {
+                        Warn(@"%@: Couldn't get local contents of %@", self, rev);
+                        return nil;
+                    }
+                    properties = rev.properties;
+                    Assert([properties objectForKey: @"_revisions"]);
+                    
+                    // Strip any attachments already known to the target db:
+                    if ([properties objectForKey: @"_attachments"]) {
+                        // Look for the latest common ancestor and stub out older attachments:
+                        NSArray* possible = [revResults objectForKey: @"possible_ancestors"];
+                        int minRevPos = findCommonAncestor(rev, possible);
+                        [TDDatabase stubOutAttachmentsIn: rev beforeRevPos: minRevPos + 1
+                                       attachmentsFollow: NO];
+                        properties = rev.properties;
+                        // If the rev has huge attachments, send it under separate cover:
+                        if ([self uploadMultipartRevision: rev])
+                            return nil;
+                    }
+                    [properties retain];  // (to survive impending autorelease-pool drain)
                 }
+                lastInboxSequence = rev.sequence;
                 Assert([properties objectForKey: @"_id"]);
                 return [properties autorelease];
             }];
@@ -150,33 +201,130 @@
             // Post the revisions to the destination. "new_edits":false means that the server should
             // use the given _rev IDs instead of making up new ones.
             NSUInteger numDocsToSend = docsToSend.count;
-            LogTo(Sync, @"%@: Sending %u revisions", self, numDocsToSend);
-            LogTo(SyncVerbose, @"%@: Sending %@", self, changes.allRevisions);
-            self.changesTotal += numDocsToSend;
-            [self asyncTaskStarted];
-            [self sendAsyncRequest: @"POST"
-                         path: @"/_bulk_docs"
-                         body: $dict({@"docs", docsToSend},
-                                     {@"new_edits", $false})
-                 onCompletion: ^(NSDictionary* response, NSError *error) {
-                     if (error) {
-                         self.error = error;
-                     } else {
-                         LogTo(SyncVerbose, @"%@: Sent %@", self, changes.allRevisions);
-                         self.lastSequence = $sprintf(@"%lld", lastInboxSequence);
+            if (numDocsToSend > 0) {
+                LogTo(Sync, @"%@: Sending %u revisions", self, (unsigned)numDocsToSend);
+                LogTo(SyncVerbose, @"%@: Sending %@", self, changes.allRevisions);
+                self.changesTotal += numDocsToSend;
+                [self asyncTaskStarted];
+                [self sendAsyncRequest: @"POST"
+                             path: @"/_bulk_docs"
+                             body: $dict({@"docs", docsToSend},
+                                         {@"new_edits", $false})
+                     onCompletion: ^(NSDictionary* response, NSError *error) {
+                         if (error) {
+                             self.error = error;
+                         } else {
+                             LogTo(SyncVerbose, @"%@: Sent %@", self, changes.allRevisions);
+                             self.lastSequence = $sprintf(@"%lld", lastInboxSequence);
+                         }
+                         self.changesProcessed += numDocsToSend;
+                         [self asyncTasksFinished: 1];
                      }
-                     self.changesProcessed += numDocsToSend;
-                     [self asyncTasksFinished: 1];
-                 }
-             ];
+                 ];
+            }
             
         } else {
             // If none of the revisions are new to the remote, just bump the lastSequence:
-            self.lastSequence = $sprintf(@"%lld", lastInboxSequence);
+            self.lastSequence = $sprintf(@"%lld", [changes.allRevisions.lastObject sequence]);
         }
         [self asyncTasksFinished: 1];
     }];
 }
 
 
+- (BOOL) uploadMultipartRevision: (TDRevision*)rev {
+    // Find all the attachments with "follows" instead of a body, and put 'em in a multipart stream:
+    TDMultipartWriter* bodyStream = nil;
+    NSDictionary* attachments = [rev.properties objectForKey: @"_attachments"];
+    for (NSString* attachmentName in attachments) {
+        NSDictionary* attachment = [attachments objectForKey: attachmentName];
+        if ([attachment objectForKey: @"follows"]) {
+            if (!bodyStream) {
+                // Create the HTTP multipart stream:
+                bodyStream = [[[TDMultipartWriter alloc] initWithContentType: @"multipart/related"
+                                                                      boundary: nil] autorelease];
+                [bodyStream setNextPartsHeaders: $dict({@"Content-Type", @"application/json"})];
+                [bodyStream addData: rev.asJSON];
+            }
+            NSString* disposition = $sprintf(@"attachment; filename=%@", TDQuoteString(attachmentName));
+            [bodyStream setNextPartsHeaders: $dict({@"Content-Disposition", disposition})];
+            [bodyStream addFileURL: [_db fileForAttachmentDict: attachment]];
+        }
+    }
+    if (!bodyStream)
+        return NO;
+    
+    // OK, we are going to upload this on its own:
+    self.changesTotal++;
+    [self asyncTaskStarted];
+
+    NSString* path = $sprintf(@"/%@?new_edits=false", TDEscapeID(rev.docID));
+    NSString* urlStr = [_remote.absoluteString stringByAppendingString: path];
+    TDMultipartUploader* uploader = [[[TDMultipartUploader alloc]
+                                  initWithURL: [NSURL URLWithString: urlStr]
+                                     streamer: bodyStream
+                               requestHeaders: self.requestHeaders
+                                 onCompletion: ^(id response, NSError *error) {
+                  if (error) {
+                      self.error = error;
+                  } else {
+                      LogTo(SyncVerbose, @"%@: Sent %@, response=%@", self, rev, response);
+                      self.lastSequence = $sprintf(@"%lld", rev.sequence);
+                  }
+                  self.changesProcessed++;
+                  [self asyncTasksFinished: 1];
+                                     
+                  _uploading = NO;
+                  [self startNextUpload];
+              }
+     ] autorelease];
+    uploader.authorizer = _authorizer;
+    LogTo(SyncVerbose, @"%@: Queuing %@ (multipart, %lldkb)", self, uploader, bodyStream.length/1024);
+    if (!_uploaderQueue)
+        _uploaderQueue = [[NSMutableArray alloc] init];
+    [_uploaderQueue addObject: uploader];
+    [self startNextUpload];
+    return YES;
+}
+
+
+- (void) startNextUpload {
+    if (!_uploading && _uploaderQueue.count > 0) {
+        _uploading = YES;
+        TDMultipartUploader* uploader = [_uploaderQueue objectAtIndex: 0];
+        LogTo(SyncVerbose, @"%@: Starting %@", self, uploader);
+        [uploader start];
+        [_uploaderQueue removeObjectAtIndex: 0];
+    }
+}
+
+
+// Given a revision and an array of revIDs, finds the latest common ancestor revID
+// and returns its generation #. If there is none, returns 0.
+static int findCommonAncestor(TDRevision* rev, NSArray* possibleRevIDs) {
+    if (possibleRevIDs.count == 0)
+        return 0;
+    NSArray* history = [TDDatabase parseCouchDBRevisionHistory: rev.properties];
+    NSString* ancestorID = [history firstObjectCommonWithArray: possibleRevIDs];
+    if (!ancestorID)
+        return 0;
+    int generation;
+    if (![TDRevision parseRevID: ancestorID intoGeneration: &generation andSuffix: NULL])
+        generation = 0;
+    return generation;
+}
+
+
 @end
+
+
+
+
+TestCase(TDPusher_findCommonAncestor) {
+    NSDictionary* revDict = $dict({@"ids", $array(@"second", @"first")}, {@"start", $object(2)});
+    TDRevision* rev = [TDRevision revisionWithProperties: $dict({@"_revisions", revDict})];
+    CAssertEq(findCommonAncestor(rev, $array()), 0);
+    CAssertEq(findCommonAncestor(rev, $array(@"3-noway", @"1-nope")), 0);
+    CAssertEq(findCommonAncestor(rev, $array(@"3-noway", @"1-first")), 1);
+    CAssertEq(findCommonAncestor(rev, $array(@"3-noway", @"2-second", @"1-first")), 2);
+}

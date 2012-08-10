@@ -14,28 +14,27 @@
 //  and limitations under the License.
 
 
-#import "TDDatabase.h"
+#import <TouchDB/TDDatabase.h>
 #import "TDDatabase+Attachments.h"
 #import "TDDatabase+Insertion.h"
 #import "TDDatabase+LocalDocs.h"
 #import "TDDatabase+Replication.h"
+#import "TDAttachment.h"
 #import "TDBody.h"
-#import "TDRevision.h"
+#import <TouchDB/TDRevision.h>
 #import "TDBlobStore.h"
 #import "TDBase64.h"
 #import "TDInternal.h"
 #import "Test.h"
-
+#import "GTMNSData+zlib.h"
 
 
 #if DEBUG
 
 
-NSString* kPath = @"/tmp/touchdb_test.sqlite3";
-
-
 static TDDatabase* createDB(void) {
-    TDDatabase *db = [TDDatabase createEmptyDBAtPath: kPath];
+    NSString* path = [NSTemporaryDirectory() stringByAppendingPathComponent: @"touchdb_test.sqlite3"];
+    TDDatabase *db = [TDDatabase createEmptyDBAtPath: path];
     CAssert([db open]);
     return db;
 }
@@ -51,6 +50,18 @@ static NSDictionary* userProperties(NSDictionary* dict) {
 }
 
 
+static TDRevision* putDoc(TDDatabase* db, NSDictionary* props) {
+    TDRevision* rev = [[[TDRevision alloc] initWithProperties: props] autorelease];
+    TDStatus status;
+    TDRevision* result = [db putRevision: rev
+                          prevRevisionID: [props objectForKey: @"_rev"]
+                           allowConflict: NO
+                                  status: &status];
+    CAssert(status < 300);
+    return result;
+}
+
+
 TestCase(TDDatabase_CRUD) {
     // Start with a fresh database in /tmp:
     TDDatabase* db = createDB();
@@ -60,13 +71,28 @@ TestCase(TDDatabase_CRUD) {
     CAssert(privateUUID.length >= 20, @"Invalid privateUUID: %@", privateUUID);
     CAssert(publicUUID.length >= 20, @"Invalid publicUUID: %@", publicUUID);
     
+    // Make sure the database-changed notifications have the right data in them (see issue #93)
+    id observer = [[NSNotificationCenter defaultCenter]
+                   addObserverForName: TDDatabaseChangeNotification
+                   object: db
+                   queue: nil
+                   usingBlock: ^(NSNotification* n) {
+                       TDRevision* rev = [n.userInfo objectForKey: @"rev"];
+                       CAssert(rev);
+                       CAssert(rev.docID);
+                       CAssert(rev.revID);
+                       CAssertEqual([rev.properties objectForKey: @"_id"], rev.docID);
+                       CAssertEqual([rev.properties objectForKey: @"_rev"], rev.revID);
+                   }];
+    
     // Create a document:
     NSMutableDictionary* props = $mdict({@"foo", $object(1)}, {@"bar", $false});
     TDBody* doc = [[[TDBody alloc] initWithProperties: props] autorelease];
     TDRevision* rev1 = [[[TDRevision alloc] initWithBody: doc] autorelease];
+    CAssert(rev1);
     TDStatus status;
     rev1 = [db putRevision: rev1 prevRevisionID: nil allowConflict: NO status: &status];
-    CAssertEq(status, 201);
+    CAssertEq(status, kTDStatusCreated);
     Log(@"Created: %@", rev1);
     CAssert(rev1.docID.length >= 10);
     CAssert([rev1.revID hasPrefix: @"1-"]);
@@ -83,7 +109,7 @@ TestCase(TDDatabase_CRUD) {
     TDRevision* rev2 = [[[TDRevision alloc] initWithBody: doc] autorelease];
     TDRevision* rev2Input = rev2;
     rev2 = [db putRevision: rev2 prevRevisionID: rev1.revID allowConflict: NO status: &status];
-    CAssertEq(status, 201);
+    CAssertEq(status, kTDStatusCreated);
     Log(@"Updated: %@", rev2);
     CAssertEqual(rev2.docID, rev1.docID);
     CAssert([rev2.revID hasPrefix: @"2-"]);
@@ -95,7 +121,7 @@ TestCase(TDDatabase_CRUD) {
     
     // Try to update the first rev, which should fail:
     CAssertNil([db putRevision: rev2Input prevRevisionID: rev1.revID allowConflict: NO status: &status]);
-    CAssertEq(status, 409);
+    CAssertEq(status, kTDStatusConflict);
     
     // Check the changes feed, with and without filters:
     TDRevisionList* changes = [db changesSinceSequence: 0 options: NULL filter: NULL];
@@ -115,16 +141,16 @@ TestCase(TDDatabase_CRUD) {
     // Delete it:
     TDRevision* revD = [[[TDRevision alloc] initWithDocID: rev2.docID revID: nil deleted: YES] autorelease];
     CAssertEq([db putRevision: revD prevRevisionID: nil allowConflict: NO status: &status], nil);
-    CAssertEq(status, 409);
+    CAssertEq(status, kTDStatusConflict);
     revD = [db putRevision: revD prevRevisionID: rev2.revID allowConflict: NO status: &status];
-    CAssertEq(status, 200);
+    CAssertEq(status, kTDStatusOK);
     CAssertEqual(revD.docID, rev2.docID);
     CAssert([revD.revID hasPrefix: @"3-"]);
     
     // Delete nonexistent doc:
     TDRevision* revFake = [[[TDRevision alloc] initWithDocID: @"fake" revID: nil deleted: YES] autorelease];
     [db putRevision: revFake prevRevisionID: nil allowConflict: NO status: &status];
-    CAssertEq(status, 404);
+    CAssertEq(status, kTDStatusNotFound);
     
     // Read it back (should fail):
     readRev = [db getDocumentWithID: revD.docID revisionID: nil options: 0];
@@ -140,6 +166,38 @@ TestCase(TDDatabase_CRUD) {
     CAssertEqual(history, $array(revD, rev2, rev1));
     
     CAssert([db close]);
+    
+    [[NSNotificationCenter defaultCenter] removeObserver: observer];
+}
+
+
+TestCase(TDDatabase_EmptyDoc) {
+    // Test case for issue #44, which is caused by a bug in TDJSON.
+    TDDatabase* db = createDB();
+    TDRevision* rev = putDoc(db, $dict());
+    TDQueryOptions options = kDefaultTDQueryOptions;
+    options.includeDocs = YES;
+    [db getDocsWithIDs: $array(rev.docID) options: &options]; // raises an exception :(
+}
+
+
+TestCase(TDDatabase_DeleteWithProperties) {
+    // Test case for issue #50.
+    // Test that it's possible to delete a document by PUTting a revision with _deleted=true,
+    // and that the saved deleted revision will preserve any extra properties.
+    TDDatabase* db = createDB();
+    TDRevision* rev1 = putDoc(db, $dict({@"property", @"value"}));
+    TDRevision* rev2 = putDoc(db, $dict({@"_id", rev1.docID},
+                                        {@"_rev", rev1.revID},
+                                        {@"_deleted", $true},
+                                        {@"property", @"newvalue"}));
+    CAssertNil([db getDocumentWithID: rev2.docID revisionID: nil options: 0]);
+    TDRevision* readRev = [db getDocumentWithID: rev2.docID revisionID: rev2.revID options: 0];
+    CAssert(readRev.deleted, @"PUTting a _deleted property didn't delete the doc");
+    CAssertEqual(readRev.properties, $dict({@"_id", rev2.docID},
+                                           {@"_rev", rev2.revID},
+                                           {@"_deleted", $true},
+                                           {@"property", @"newvalue"}));
 }
 
 
@@ -167,7 +225,7 @@ TestCase(TDDatabase_Validation) {
     validationCalled = NO;
     rev = [db putRevision: rev prevRevisionID: nil allowConflict: NO status: &status];
     CAssert(validationCalled);
-    CAssertEq(status, 201);
+    CAssertEq(status, kTDStatusCreated);
     
     // PUT a valid update:
     [props setObject: $object(3) forKey: @"head_count"];
@@ -175,15 +233,16 @@ TestCase(TDDatabase_Validation) {
     validationCalled = NO;
     rev = [db putRevision: rev prevRevisionID: rev.revID allowConflict: NO status: &status];
     CAssert(validationCalled);
-    CAssertEq(status, 201);
+    CAssertEq(status, kTDStatusCreated);
     
     // PUT an invalid update:
     [props removeObjectForKey: @"towel"];
     rev.properties = props;
     validationCalled = NO;
+#pragma unused (rev)  // tell analyzer to ignore dead stores below
     rev = [db putRevision: rev prevRevisionID: rev.revID allowConflict: NO status: &status];
     CAssert(validationCalled);
-    CAssertEq(status, 403);
+    CAssertEq(status, kTDStatusForbidden);
     
     // POST an invalid new document:
     props = $mdict({@"name", @"Vogon"}, {@"poetry", $true});
@@ -191,7 +250,7 @@ TestCase(TDDatabase_Validation) {
     validationCalled = NO;
     rev = [db putRevision: rev prevRevisionID: nil allowConflict: NO status: &status];
     CAssert(validationCalled);
-    CAssertEq(status, 403);
+    CAssertEq(status, kTDStatusForbidden);
 
     // PUT a valid new document with an ID:
     props = $mdict({@"_id", @"ford"}, {@"name", @"Ford Prefect"}, {@"towel", @"terrycloth"});
@@ -199,7 +258,7 @@ TestCase(TDDatabase_Validation) {
     validationCalled = NO;
     rev = [db putRevision: rev prevRevisionID: nil allowConflict: NO status: &status];
     CAssert(validationCalled);
-    CAssertEq(status, 201);
+    CAssertEq(status, kTDStatusCreated);
     CAssertEqual(rev.docID, @"ford");
     
     // DELETE a document:
@@ -207,7 +266,7 @@ TestCase(TDDatabase_Validation) {
     CAssert(rev.deleted);
     validationCalled = NO;
     rev = [db putRevision: rev prevRevisionID:  rev.revID allowConflict: NO status: &status];
-    CAssertEq(status, 200);
+    CAssertEq(status, kTDStatusOK);
     CAssert(validationCalled);
 
     // PUT an invalid new document:
@@ -216,7 +275,7 @@ TestCase(TDDatabase_Validation) {
     validationCalled = NO;
     rev = [db putRevision: rev prevRevisionID: nil allowConflict: NO status: &status];
     CAssert(validationCalled);
-    CAssertEq(status, 403);
+    CAssertEq(status, kTDStatusForbidden);
     
     CAssert([db close]);
 }
@@ -247,7 +306,7 @@ TestCase(TDDatabase_RevTree) {
     rev.properties = $dict({@"_id", rev.docID}, {@"_rev", rev.revID}, {@"message", @"hi"});
     NSArray* history = $array(rev.revID, @"3-thrice", @"2-too", @"1-won");
     TDStatus status = [db forceInsert: rev revisionHistory: history source: nil];
-    CAssertEq(status, 201);
+    CAssertEq(status, kTDStatusCreated);
     CAssertEq(db.documentCount, 1u);
     verifyHistory(db, rev, history);
     
@@ -256,7 +315,7 @@ TestCase(TDDatabase_RevTree) {
                                 {@"message", @"yo"});
     history = $array(conflict.revID, @"4-delta", @"3-gamma", @"2-too", @"1-won");
     status = [db forceInsert: conflict revisionHistory: history source: nil];
-    CAssertEq(status, 201);
+    CAssertEq(status, kTDStatusCreated);
     CAssertEq(db.documentCount, 1u);
     verifyHistory(db, conflict, history);
     
@@ -264,7 +323,7 @@ TestCase(TDDatabase_RevTree) {
     TDRevision* other = [[[TDRevision alloc] initWithDocID: @"AnotherDocID" revID: @"1-ichi" deleted: NO] autorelease];
     other.properties = $dict({@"language", @"jp"});
     status = [db forceInsert: other revisionHistory: $array(other.revID) source: nil];
-    CAssertEq(status, 201);
+    CAssertEq(status, kTDStatusCreated);
     
     // Fetch one of those phantom revisions with no body:
     TDRevision* rev2 = [db getDocumentWithID: rev.docID revisionID: @"2-too" options: 0];
@@ -289,6 +348,59 @@ TestCase(TDDatabase_RevTree) {
 }
 
 
+TestCase(TDDatabase_DeterministicRevIDs) {
+    TDDatabase* db = createDB();
+    TDRevision* rev = putDoc(db, $dict({@"_id", @"mydoc"}, {@"key", @"value"}));
+    NSString* revID = rev.revID;
+    [db close];
+    
+    db = createDB();
+    rev = putDoc(db, $dict({@"_id", @"mydoc"}, {@"key", @"value"}));
+    CAssertEqual(rev.revID, revID);
+}
+
+
+TestCase(TDDatabase_DuplicateRev) {
+    TDDatabase* db = createDB();
+    TDRevision* rev1 = putDoc(db, $dict({@"_id", @"mydoc"}, {@"key", @"value"}));
+    
+    NSDictionary* props = $dict({@"_id", @"mydoc"},
+                                {@"_rev", rev1.revID},
+                                {@"key", @"new-value"});
+    TDRevision* rev2a = putDoc(db, props);
+
+    TDRevision* rev2b = [[[TDRevision alloc] initWithProperties: props] autorelease];
+    TDStatus status;
+    rev2b = [db putRevision: rev2b
+             prevRevisionID: rev1.revID
+              allowConflict: YES
+                     status: &status];
+    CAssertEq(status, kTDStatusOK);
+    CAssertEqual(rev2b, rev2a);
+}
+
+
+#pragma mark - ATTACHMENTS:
+
+
+static void insertAttachment(TDDatabase* db, NSData* blob,
+                                 SequenceNumber sequence,
+                                 NSString* name, NSString* type,
+                                 TDAttachmentEncoding encoding,
+                                 UInt64 length, UInt64 encodedLength,
+                                 unsigned revpos)
+{
+    TDAttachment* attachment = [[TDAttachment alloc] initWithName: name contentType: type];
+    [attachment autorelease];
+    CAssert([db storeBlob: blob creatingKey: &attachment->blobKey], @"Failed to store blob");
+    attachment->encoding = encoding;
+    attachment->length = length;
+    attachment->encodedLength = encodedLength;
+    attachment->revpos = revpos;
+    CAssertEq([db insertAttachment: attachment forSequence: sequence], kTDStatusCreated);
+}
+
+
 TestCase(TDDatabase_Attachments) {
     RequireTestCase(TDDatabase_CRUD);
     // Start with a fresh database in /tmp:
@@ -304,19 +416,24 @@ TestCase(TDDatabase_Attachments) {
     rev1 = [db putRevision: [TDRevision revisionWithProperties:$dict({@"foo", $object(1)},
                                                                      {@"bar", $false})]
             prevRevisionID: nil allowConflict: NO status: &status];
-    CAssertEq(status, 201);
+    CAssertEq(status, kTDStatusCreated);
     
     NSData* attach1 = [@"This is the body of attach1" dataUsingEncoding: NSUTF8StringEncoding];
-    CAssertEq([db insertAttachment: attach1 forSequence: rev1.sequence
-                             named: @"attach" type: @"text/plain"
-                            revpos: rev1.generation],
-              201);
+    insertAttachment(db, attach1,
+                     rev1.sequence,
+                     @"attach", @"text/plain",
+                     kTDAttachmentEncodingNone,
+                     attach1.length,
+                     0,
+                     rev1.generation);
     
     NSString* type;
+    TDAttachmentEncoding encoding;
     CAssertEqual([db getAttachmentForSequence: rev1.sequence named: @"attach"
-                                         type: &type status: &status], attach1);
-    CAssertEq(status, 200);
+                                         type: &type encoding: &encoding status: &status], attach1);
+    CAssertEq(status, kTDStatusOK);
     CAssertEqual(type, @"text/plain");
+    CAssertEq(encoding, kTDAttachmentEncodingNone);
     
     // Check the attachment dict:
     NSMutableDictionary* itemDict = $mdict({@"content_type", @"text/plain"},
@@ -325,7 +442,7 @@ TestCase(TDDatabase_Attachments) {
                                            {@"stub", $true},
                                            {@"revpos", $object(1)});
     NSDictionary* attachmentDict = $dict({@"attach", itemDict});
-    CAssertEqual([db getAttachmentDictForSequence: rev1.sequence withContent: NO], attachmentDict);
+    CAssertEqual([db getAttachmentDictForSequence: rev1.sequence options: 0], attachmentDict);
     TDRevision* gotRev1 = [db getDocumentWithID: rev1.docID revisionID: rev1.revID
                                 options: 0];
     CAssertEqual([gotRev1.properties objectForKey: @"_attachments"], attachmentDict);
@@ -333,7 +450,7 @@ TestCase(TDDatabase_Attachments) {
     // Check the attachment dict, with attachments included:
     [itemDict removeObjectForKey: @"stub"];
     [itemDict setObject: [TDBase64 encode: attach1] forKey: @"data"];
-    CAssertEqual([db getAttachmentDictForSequence: rev1.sequence withContent: YES], attachmentDict);
+    CAssertEqual([db getAttachmentDictForSequence: rev1.sequence options: kTDIncludeAttachments], attachmentDict);
     gotRev1 = [db getDocumentWithID: rev1.docID revisionID: rev1.revID
                             options: kTDIncludeAttachments];
     CAssertEqual([gotRev1.properties objectForKey: @"_attachments"], attachmentDict);
@@ -344,7 +461,7 @@ TestCase(TDDatabase_Attachments) {
                                                                       {@"foo", $object(2)},
                                                                       {@"bazz", $false})]
             prevRevisionID: rev1.revID allowConflict: NO status: &status];
-    CAssertEq(status, 201);
+    CAssertEq(status, kTDStatusCreated);
     
     [db copyAttachmentNamed: @"attach" fromSequence: rev1.sequence toSequence: rev2.sequence];
 
@@ -354,29 +471,37 @@ TestCase(TDDatabase_Attachments) {
                                                                       {@"foo", $object(2)},
                                                                       {@"bazz", $false})]
             prevRevisionID: rev2.revID allowConflict: NO status: &status];
-    CAssertEq(status, 201);
+    CAssertEq(status, kTDStatusCreated);
     
     NSData* attach2 = [@"<html>And this is attach2</html>" dataUsingEncoding: NSUTF8StringEncoding];
-    CAssertEq([db insertAttachment: attach2 forSequence: rev3.sequence
-                             named: @"attach" type: @"text/html" revpos: rev2.generation],
-              201);
+    insertAttachment(db, attach2,
+                     rev3.sequence,
+                     @"attach", @"text/html",
+                     kTDAttachmentEncodingNone,
+                     attach2.length,
+                     0,
+                     rev2.generation);
     
     // Check the 2nd revision's attachment:
     type = nil;
     CAssertEqual([db getAttachmentForSequence: rev2.sequence
                                         named: @"attach"
                                          type: &type
+                                     encoding: &encoding
                                        status: &status], attach1);
-    CAssertEq(status, 200);
+    CAssertEq(status, kTDStatusOK);
     CAssertEqual(type, @"text/plain");
+    CAssertEq(encoding, kTDAttachmentEncodingNone);
     
     // Check the 3rd revision's attachment:
     CAssertEqual([db getAttachmentForSequence: rev3.sequence
                                         named: @"attach"
                                          type: &type
+                                     encoding: &encoding
                                        status: &status], attach2);
-    CAssertEq(status, 200);
+    CAssertEq(status, kTDStatusOK);
     CAssertEqual(type, @"text/html");
+    CAssertEq(encoding, kTDAttachmentEncodingNone);
     
     // Examine the attachment store:
     CAssertEq(attachments.count, 2u);
@@ -384,7 +509,7 @@ TestCase(TDDatabase_Attachments) {
                                              [TDBlobStore keyDataForBlob: attach2], nil];
     CAssertEqual([NSSet setWithArray: attachments.allKeys], expected);
     
-    CAssertEq([db compact], 200);  // This clears the body of the first revision
+    CAssertEq([db compact], kTDStatusOK);  // This clears the body of the first revision
     CAssertEq(attachments.count, 1u);
     CAssertEqual(attachments.allKeys, $array([TDBlobStore keyDataForBlob: attach2]));
 }
@@ -407,7 +532,7 @@ TestCase(TDDatabase_PutAttachment) {
     TDStatus status;
     rev1 = [db putRevision: [TDRevision revisionWithProperties: props]
             prevRevisionID: nil allowConflict: NO status: &status];
-    CAssertEq(status, 201);
+    CAssertEq(status, kTDStatusCreated);
 
     // Examine the attachment store:
     CAssertEq(db.attachmentStore.count, 1u);
@@ -425,17 +550,20 @@ TestCase(TDDatabase_PutAttachment) {
     // Update the attachment directly:
     NSData* attachv2 = [@"Replaced body of attach" dataUsingEncoding: NSUTF8StringEncoding];
     [db updateAttachment: @"attach" body: attachv2 type: @"application/foo"
+                encoding: kTDAttachmentEncodingNone
                  ofDocID: rev1.docID revID: nil
                   status: &status];
-    CAssertEq(status, 409);
+    CAssertEq(status, kTDStatusConflict);
     [db updateAttachment: @"attach" body: attachv2 type: @"application/foo"
+                encoding: kTDAttachmentEncodingNone
                  ofDocID: rev1.docID revID: @"1-bogus"
                   status: &status];
-    CAssertEq(status, 409);
+    CAssertEq(status, kTDStatusConflict);
     TDRevision* rev2 = [db updateAttachment: @"attach" body: attachv2 type: @"application/foo"
+                                   encoding: kTDAttachmentEncodingNone
                                     ofDocID: rev1.docID revID: rev1.revID
                                      status: &status];
-    CAssertEq(status, 201);
+    CAssertEq(status, kTDStatusCreated);
     CAssertEqual(rev2.docID, rev1.docID);
     CAssertEq(rev2.generation, 2u);
 
@@ -451,17 +579,20 @@ TestCase(TDDatabase_PutAttachment) {
     
     // Delete the attachment:
     [db updateAttachment: @"nosuchattach" body: nil type: nil
+                encoding: kTDAttachmentEncodingNone
                  ofDocID: rev2.docID revID: rev2.revID
                   status: &status];
-    CAssertEq(status, 404);
+    CAssertEq(status, kTDStatusAttachmentNotFound);
     [db updateAttachment: @"nosuchattach" body: nil type: nil
+                encoding: kTDAttachmentEncodingNone
                  ofDocID: @"nosuchdoc" revID: @"nosuchrev"
                   status: &status];
-    CAssertEq(status, 404);
+    CAssertEq(status, kTDStatusNotFound);
     TDRevision* rev3 = [db updateAttachment: @"attach" body: nil type: nil
+                                   encoding: kTDAttachmentEncodingNone
                                     ofDocID: rev2.docID revID: rev2.revID
                                      status: &status];
-    CAssertEq(status, 200);
+    CAssertEq(status, kTDStatusOK);
     CAssertEqual(rev3.docID, rev2.docID);
     CAssertEq(rev3.generation, 3u);
     
@@ -472,21 +603,134 @@ TestCase(TDDatabase_PutAttachment) {
 }
 
 
+TestCase(TDDatabase_EncodedAttachment) {
+    RequireTestCase(TDDatabase_Attachments);
+    // Start with a fresh database in /tmp:
+    TDDatabase* db = createDB();
+
+    // Add a revision and an attachment to it:
+    TDRevision* rev1;
+    TDStatus status;
+    rev1 = [db putRevision: [TDRevision revisionWithProperties:$dict({@"foo", $object(1)},
+                                                                     {@"bar", $false})]
+            prevRevisionID: nil allowConflict: NO status: &status];
+    CAssertEq(status, kTDStatusCreated);
+    
+    NSData* attach1 = [@"Encoded! Encoded!Encoded! Encoded! Encoded! Encoded! Encoded! Encoded!"
+                            dataUsingEncoding: NSUTF8StringEncoding];
+    NSData* encoded = [NSData gtm_dataByGzippingData: attach1];
+    insertAttachment(db, encoded,
+                     rev1.sequence,
+                     @"attach", @"text/plain",
+                     kTDAttachmentEncodingGZIP,
+                     attach1.length,
+                     encoded.length,
+                     rev1.generation);
+    
+    // Read the attachment without decoding it:
+    NSString* type;
+    TDAttachmentEncoding encoding;
+    CAssertEqual([db getAttachmentForSequence: rev1.sequence named: @"attach"
+                                         type: &type encoding: &encoding status: &status], encoded);
+    CAssertEq(status, kTDStatusOK);
+    CAssertEqual(type, @"text/plain");
+    CAssertEq(encoding, kTDAttachmentEncodingGZIP);
+    
+    // Read the attachment, decoding it:
+    CAssertEqual([db getAttachmentForSequence: rev1.sequence named: @"attach"
+                                         type: &type encoding: NULL status: &status], attach1);
+    CAssertEq(status, kTDStatusOK);
+    CAssertEqual(type, @"text/plain");
+    
+    // Check the stub attachment dict:
+    NSMutableDictionary* itemDict = $mdict({@"content_type", @"text/plain"},
+                                           {@"digest", @"sha1-fhfNE/UKv/wgwDNPtNvG5DN/5Bg="},
+                                           {@"length", $object(70)},
+                                           {@"encoding", @"gzip"},
+                                           {@"encoded_length", $object(37)},
+                                           {@"stub", $true},
+                                           {@"revpos", $object(1)});
+    NSDictionary* attachmentDict = $dict({@"attach", itemDict});
+    CAssertEqual([db getAttachmentDictForSequence: rev1.sequence options: 0], attachmentDict);
+    TDRevision* gotRev1 = [db getDocumentWithID: rev1.docID revisionID: rev1.revID
+                                options: 0];
+    CAssertEqual([gotRev1.properties objectForKey: @"_attachments"], attachmentDict);
+
+    // Check the attachment dict with encoded data:
+    [itemDict setObject: [TDBase64 encode: encoded] forKey: @"data"];
+    [itemDict removeObjectForKey: @"stub"];
+    CAssertEqual([db getAttachmentDictForSequence: rev1.sequence
+                                          options: kTDIncludeAttachments | kTDLeaveAttachmentsEncoded],
+                 attachmentDict);
+    gotRev1 = [db getDocumentWithID: rev1.docID revisionID: rev1.revID
+                            options: kTDIncludeAttachments | kTDLeaveAttachmentsEncoded];
+    CAssertEqual([gotRev1.properties objectForKey: @"_attachments"], attachmentDict);
+
+    // Check the attachment dict with data:
+    [itemDict setObject: [TDBase64 encode: attach1] forKey: @"data"];
+    [itemDict removeObjectForKey: @"encoding"];
+    [itemDict removeObjectForKey: @"encoded_length"];
+    CAssertEqual([db getAttachmentDictForSequence: rev1.sequence options: kTDIncludeAttachments], attachmentDict);
+    gotRev1 = [db getDocumentWithID: rev1.docID revisionID: rev1.revID
+                            options: kTDIncludeAttachments];
+    CAssertEqual([gotRev1.properties objectForKey: @"_attachments"], attachmentDict);
+}
+
+
+TestCase(TDDatabase_StubOutAttachmentsBeforeRevPos) {
+    NSDictionary* hello = $dict({@"revpos", $object(1)}, {@"follows", $true});
+    NSDictionary* goodbye = $dict({@"revpos", $object(2)}, {@"data", @"squeeee"});
+    NSDictionary* attachments = $dict({@"hello", hello}, {@"goodbye", goodbye});
+    
+    TDRevision* rev = [TDRevision revisionWithProperties: $dict({@"_attachments", attachments})];
+    [TDDatabase stubOutAttachmentsIn: rev beforeRevPos: 3 attachmentsFollow: NO];
+    CAssertEqual(rev.properties, $dict({@"_attachments", $dict({@"hello", $dict({@"revpos", $object(1)}, {@"stub", $true})},
+                                                               {@"goodbye", $dict({@"revpos", $object(2)}, {@"stub", $true})})}));
+    
+    rev = [TDRevision revisionWithProperties: $dict({@"_attachments", attachments})];
+    [TDDatabase stubOutAttachmentsIn: rev beforeRevPos: 2 attachmentsFollow: NO];
+    CAssertEqual(rev.properties, $dict({@"_attachments", $dict({@"hello", $dict({@"revpos", $object(1)}, {@"stub", $true})},
+                                                               {@"goodbye", goodbye})}));
+    
+    rev = [TDRevision revisionWithProperties: $dict({@"_attachments", attachments})];
+    [TDDatabase stubOutAttachmentsIn: rev beforeRevPos: 1 attachmentsFollow: NO];
+    CAssertEqual(rev.properties, $dict({@"_attachments", attachments}));
+    
+    // Now test the "follows" mode:
+    rev = [TDRevision revisionWithProperties: $dict({@"_attachments", attachments})];
+    [TDDatabase stubOutAttachmentsIn: rev beforeRevPos: 3 attachmentsFollow: YES];
+    CAssertEqual(rev.properties, $dict({@"_attachments", $dict({@"hello", $dict({@"revpos", $object(1)}, {@"stub", $true})},
+                                                               {@"goodbye", $dict({@"revpos", $object(2)}, {@"stub", $true})})}));
+
+    rev = [TDRevision revisionWithProperties: $dict({@"_attachments", attachments})];
+    [TDDatabase stubOutAttachmentsIn: rev beforeRevPos: 2 attachmentsFollow: YES];
+    CAssertEqual(rev.properties, $dict({@"_attachments", $dict({@"hello", $dict({@"revpos", $object(1)}, {@"stub", $true})},
+                                                               {@"goodbye", $dict({@"revpos", $object(2)}, {@"follows", $true})})}));
+    
+    rev = [TDRevision revisionWithProperties: $dict({@"_attachments", attachments})];
+    [TDDatabase stubOutAttachmentsIn: rev beforeRevPos: 1 attachmentsFollow: YES];
+    CAssertEqual(rev.properties, $dict({@"_attachments", $dict({@"hello", $dict({@"revpos", $object(1)}, {@"follows", $true})},
+                                                               {@"goodbye", $dict({@"revpos", $object(2)}, {@"follows", $true})})}));
+    
+}
+
+
+#pragma mark - MISC.:
+
+
 TestCase(TDDatabase_ReplicatorSequences) {
     RequireTestCase(TDDatabase_CRUD);
     TDDatabase* db = createDB();
-    NSURL* remote = [NSURL URLWithString: @"http://iriscouch.com/"];
-    CAssertNil([db lastSequenceWithRemoteURL: remote push: NO]);
-    CAssertNil([db lastSequenceWithRemoteURL: remote push: YES]);
-    [db setLastSequence: @"lastpull" withRemoteURL: remote push: NO];
-    CAssertEqual([db lastSequenceWithRemoteURL: remote push: NO], @"lastpull");
-    CAssertNil([db lastSequenceWithRemoteURL: remote push: YES]);
-    [db setLastSequence: @"newerpull" withRemoteURL: remote push: NO];
-    CAssertEqual([db lastSequenceWithRemoteURL: remote push: NO], @"newerpull");
-    CAssertNil([db lastSequenceWithRemoteURL: remote push: YES]);
-    [db setLastSequence: @"lastpush" withRemoteURL: remote push: YES];
-    CAssertEqual([db lastSequenceWithRemoteURL: remote push: NO], @"newerpull");
-    CAssertEqual([db lastSequenceWithRemoteURL: remote push: YES], @"lastpush");
+    CAssertNil([db lastSequenceWithCheckpointID: @"pull"]);
+    [db setLastSequence: @"lastpull" withCheckpointID: @"pull"];
+    CAssertEqual([db lastSequenceWithCheckpointID: @"pull"], @"lastpull");
+    CAssertNil([db lastSequenceWithCheckpointID: @"push"]);
+    [db setLastSequence: @"newerpull" withCheckpointID: @"pull"];
+    CAssertEqual([db lastSequenceWithCheckpointID: @"pull"], @"newerpull");
+    CAssertNil([db lastSequenceWithCheckpointID: @"push"]);
+    [db setLastSequence: @"lastpush" withCheckpointID: @"push"];
+    CAssertEqual([db lastSequenceWithCheckpointID: @"pull"], @"newerpull");
+    CAssertEqual([db lastSequenceWithCheckpointID: @"push"], @"lastpush");
 }
 
 
@@ -501,7 +745,7 @@ TestCase(TDDatabase_LocalDocs) {
     TDRevision* rev1 = [[[TDRevision alloc] initWithBody: doc] autorelease];
     TDStatus status;
     rev1 = [db putLocalRevision: rev1 prevRevisionID: nil status: &status];
-    CAssertEq(status, 201);
+    CAssertEq(status, kTDStatusCreated);
     Log(@"Created: %@", rev1);
     CAssertEqual(rev1.docID, @"_local/doc1");
     CAssert([rev1.revID hasPrefix: @"1-"]);
@@ -520,7 +764,7 @@ TestCase(TDDatabase_LocalDocs) {
     TDRevision* rev2 = [[[TDRevision alloc] initWithBody: doc] autorelease];
     TDRevision* rev2Input = rev2;
     rev2 = [db putLocalRevision: rev2 prevRevisionID: rev1.revID status: &status];
-    CAssertEq(status, 201);
+    CAssertEq(status, kTDStatusCreated);
     Log(@"Updated: %@", rev2);
     CAssertEqual(rev2.docID, rev1.docID);
     CAssert([rev2.revID hasPrefix: @"2-"]);
@@ -532,19 +776,19 @@ TestCase(TDDatabase_LocalDocs) {
     
     // Try to update the first rev, which should fail:
     CAssertNil([db putLocalRevision: rev2Input prevRevisionID: rev1.revID status: &status]);
-    CAssertEq(status, 409);
+    CAssertEq(status, kTDStatusConflict);
     
     // Delete it:
     TDRevision* revD = [[[TDRevision alloc] initWithDocID: rev2.docID revID: nil deleted: YES] autorelease];
     CAssertEq([db putLocalRevision: revD prevRevisionID: nil status: &status], nil);
-    CAssertEq(status, 409);
+    CAssertEq(status, kTDStatusConflict);
     revD = [db putLocalRevision: revD prevRevisionID: rev2.revID status: &status];
-    CAssertEq(status, 200);
+    CAssertEq(status, kTDStatusOK);
     
     // Delete nonexistent doc:
     TDRevision* revFake = [[[TDRevision alloc] initWithDocID: @"_local/fake" revID: nil deleted: YES] autorelease];
     [db putLocalRevision: revFake prevRevisionID: nil status: &status];
-    CAssertEq(status, 404);
+    CAssertEq(status, kTDStatusNotFound);
     
     // Read it back (should fail):
     readRev = [db getLocalDocumentWithID: revD.docID revisionID: nil];
@@ -554,13 +798,75 @@ TestCase(TDDatabase_LocalDocs) {
 }
 
 
+TestCase(TDDatabase_FindMissingRevisions) {
+    TDDatabase* db = createDB();
+    TDRevision* doc1r1 = putDoc(db, $dict({@"_id", @"11111"}, {@"key", @"one"}));
+    TDRevision* doc2r1 = putDoc(db, $dict({@"_id", @"22222"}, {@"key", @"two"}));
+    putDoc(db, $dict({@"_id", @"33333"}, {@"key", @"three"}));
+    putDoc(db, $dict({@"_id", @"44444"}, {@"key", @"four"}));
+    putDoc(db, $dict({@"_id", @"55555"}, {@"key", @"five"}));
+
+    TDRevision* doc1r2 = putDoc(db, $dict({@"_id", @"11111"}, {@"_rev", doc1r1.revID}, {@"key", @"one+"}));
+    TDRevision* doc2r2 = putDoc(db, $dict({@"_id", @"22222"}, {@"_rev", doc2r1.revID}, {@"key", @"two+"}));
+    
+    putDoc(db, $dict({@"_id", @"11111"}, {@"_rev", doc1r2.revID}, {@"_deleted", $true}));
+    
+    // Now call -findMissingRevisions:
+    TDRevision* revToFind1 = [[[TDRevision alloc] initWithDocID: @"11111" revID: @"3-bogus" deleted: NO] autorelease];
+    TDRevision* revToFind2 = [[[TDRevision alloc] initWithDocID: @"22222" revID: doc2r2.revID deleted: NO] autorelease];
+    TDRevision* revToFind3 = [[[TDRevision alloc] initWithDocID: @"99999" revID: @"9-huh" deleted: NO] autorelease];
+    TDRevisionList* revs = [[[TDRevisionList alloc] initWithArray: $array(revToFind1, revToFind2, revToFind3)] autorelease];
+    CAssert([db findMissingRevisions: revs]);
+    CAssertEqual(revs.allRevisions, $array(revToFind1, revToFind3));
+    
+    // Check the possible ancestors:
+    CAssertEqual([db getPossibleAncestorRevisionIDs: revToFind1 limit: 0],
+                 $array(doc1r2.revID, doc1r1.revID));
+    CAssertEqual([db getPossibleAncestorRevisionIDs: revToFind1 limit: 1],
+                 $array(doc1r2.revID));
+    CAssertEqual([db getPossibleAncestorRevisionIDs: revToFind3 limit: 0], nil);
+    
+}
+
+
+TestCase(TDDatabase_Purge) {
+    TDDatabase* db = createDB();
+    TDRevision* rev1 = putDoc(db, $dict({@"_id", @"doc"}, {@"key", @"1"}));
+    TDRevision* rev2 = putDoc(db, $dict({@"_id", @"doc"}, {@"_rev", rev1.revID}, {@"key", @"2"}));
+    TDRevision* rev3 = putDoc(db, $dict({@"_id", @"doc"}, {@"_rev", rev2.revID}, {@"key", @"3"}));
+
+    // Try to purge rev2, which should fail since it's not a leaf:
+    NSDictionary* toPurge = $dict({@"doc", $array(rev2.revID)});
+    NSDictionary* result;
+    CAssertEq([db purgeRevisions: toPurge result: &result], kTDStatusOK);
+    CAssertEqual(result, $dict({@"doc", $array()}));
+    CAssertEq([[result objectForKey: @"doc"] count], 0u);
+
+    // Purge rev3:
+    toPurge = $dict({@"doc", $array(rev3.revID)});
+    CAssertEq([db purgeRevisions: toPurge result: &result], kTDStatusOK);
+    CAssertEqual([result allKeys], $array(@"doc"));
+    NSSet* purged = [NSSet setWithArray: [result objectForKey: @"doc"]];
+    NSSet* expectedPurged = [NSSet setWithObjects: rev1.revID, rev2.revID, rev3.revID, nil];
+    CAssertEqual(purged, expectedPurged);
+
+    TDRevisionList* remainingRevs = [db getAllRevisionsOfDocumentID: @"doc" onlyCurrent: NO];
+    CAssertEq(remainingRevs.count, 0u);
+}
+
+
 TestCase(TDDatabase) {
     RequireTestCase(TDDatabase_CRUD);
+    RequireTestCase(TDDatabase_DeleteWithProperties);
     RequireTestCase(TDDatabase_RevTree);
     RequireTestCase(TDDatabase_Attachments);
     RequireTestCase(TDDatabase_PutAttachment);
+    RequireTestCase(TDDatabase_EncodedAttachment);
+    RequireTestCase(TDDatabase_StubOutAttachmentsBeforeRevPos);
     RequireTestCase(TDDatabase_ReplicatorSequences);
     RequireTestCase(TDDatabase_LocalDocs);
+    RequireTestCase(TDDatabase_FindMissingRevisions);
+    RequireTestCase(TDDatabase_Purge);
 }
 
 

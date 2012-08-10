@@ -8,17 +8,20 @@
  */
 
 #import <TouchDB/TDRevision.h>
+#import <TouchDB/TDStatus.h>
 @class FMDatabase, TDView, TDBlobStore;
 struct TDQueryOptions;      // declared in TDView.h
-
-
-/** Same interpretation as HTTP status codes, esp. 200, 201, 404, 409, 500. */
-typedef int TDStatus;
 
 
 /** NSNotification posted when a document is updated.
     The userInfo key "rev" has a TDRevision* as its value. */
 extern NSString* const TDDatabaseChangeNotification;
+
+/** NSNotification posted when a database is closing. */
+extern NSString* const TDDatabaseWillCloseNotification;
+
+/** NSNotification posted when a database is about to be deleted (but before it closes). */
+extern NSString* const TDDatabaseWillBeDeletedNotification;
 
 
 /** Filter block, used in changes feeds and replication. */
@@ -28,11 +31,14 @@ typedef BOOL (^TDFilterBlock) (TDRevision* revision);
 /** Options for what metadata to include in document bodies */
 typedef unsigned TDContentOptions;
 enum {
-    kTDIncludeAttachments = 1,
-    kTDIncludeConflicts = 2,
-    kTDIncludeRevs = 4,
-    kTDIncludeRevsInfo = 8,
-    kTDIncludeLocalSeq = 16
+    kTDIncludeAttachments = 1,              // adds inline bodies of attachments
+    kTDIncludeConflicts = 2,                // adds '_conflicts' property (if relevant)
+    kTDIncludeRevs = 4,                     // adds '_revisions' property
+    kTDIncludeRevsInfo = 8,                 // adds '_revs_info' property
+    kTDIncludeLocalSeq = 16,                // adds '_local_seq' property
+    kTDLeaveAttachmentsEncoded = 32,        // i.e. don't decode
+    kTDBigAttachmentsFollow = 64,           // i.e. add 'follows' key instead of data for big ones
+    kTDNoBody = 128                         // omit regular doc body properties
 };
 
 
@@ -57,11 +63,12 @@ extern const TDChangesOptions kDefaultTDChangesOptions;
     NSString* _name;
     FMDatabase *_fmdb;
     BOOL _open;
-    NSInteger _transactionLevel;
+    int _transactionLevel;
     NSMutableDictionary* _views;
     NSMutableDictionary* _validations;
     NSMutableDictionary* _filters;
     TDBlobStore* _attachments;
+    NSMutableDictionary* _pendingAttachmentsByDigest;
     NSMutableArray* _activeReplicators;
 }    
         
@@ -99,8 +106,10 @@ extern const TDChangesOptions kDefaultTDChangesOptions;
     @param commit  If YES, commits; if NO, aborts and rolls back, undoing all changes made since the matching -beginTransaction call, *including* any committed nested transactions. */
 - (BOOL) endTransaction: (BOOL)commit;
 
-/** Compacts the database storage by removing the bodies and attachments of obsolete revisions. */
-- (TDStatus) compact;
+/** Executes the block within a database transaction.
+    If the block returns a non-OK status, the transaction is aborted/rolled back.
+    Any exception raised by the block will be caught and treated as kTDStatusException. */
+- (TDStatus) inTransaction: (TDStatus(^)())block;
 
 // DOCUMENTS:
 
@@ -124,6 +133,16 @@ extern const TDChangesOptions kDefaultTDChangesOptions;
 /** Returns all the known revisions (or all current/conflicting revisions) of a document. */
 - (TDRevisionList*) getAllRevisionsOfDocumentID: (NSString*)docID
                                     onlyCurrent: (BOOL)onlyCurrent;
+
+- (NSArray*) getConflictingRevisionIDsOfDocID: (NSString*)docID;
+
+/** Returns IDs of local revisions of the same document, that have a lower generation number.
+    Does not return revisions whose bodies have been compacted away, or deletion markers. */
+- (NSArray*) getPossibleAncestorRevisionIDs: (TDRevision*)rev
+                                      limit: (unsigned)limit;
+
+/** Returns the most recent member of revIDs that appears in rev's ancestry. */
+- (NSString*) findCommonAncestorOf: (TDRevision*)rev withRevIDs: (NSArray*)revIDs;
 
 // VIEWS & QUERIES:
 
